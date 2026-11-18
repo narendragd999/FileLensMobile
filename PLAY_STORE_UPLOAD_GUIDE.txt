@@ -1,0 +1,165 @@
+﻿================================================================================
+          COMPLETE GOOGLE PLAY STORE UPLOAD & RELEASE GUIDE
+                            FOR FILELENSPRO
+================================================================================
+
+App Name        : FileLensPro - Search & OCR
+Package Name    : com.filelenspro.app
+Version Name    : 1.0.0
+Version Code    : 2
+AAB File Path   : D:\Antigravity\FileLensProTestBundle\android\app\build\outputs\bundle\release\app-release.aab
+AAB File Size   : 104.14 MB (Signed with Original Play Store Key)
+APK File Path   : D:\Antigravity\FileLensProTestBundle\android\app\build\outputs\apk\release\app-release.apk
+APK File Size   : 87.62 MB (Compressed & Signed with Original Play Store Key)
+Date Prepared   : August 31, 2026
+
+================================================================================
+STEP 1: READY-TO-USE EXTERNAL LINKS
+================================================================================
+
+1. Privacy Policy URL (HTTPS):
+   https://narendragd999.github.io/FileLensScanner/privacy.html
+
+2. MANAGE_EXTERNAL_STORAGE Declaration & Tutorial Video URL:
+   https://youtube.com/shorts/FgSD-9TiLto?feature=share
+
+================================================================================
+STEP 2: STORE LISTING COPY (COPY & PASTE READY)
+================================================================================
+
+--- App Title (Max 30 characters) ---
+FileLensPro - Search & OCR
+
+--- Short Description (Max 80 characters) ---
+Fast offline file search, document OCR, Hindi/English indexing & duplicate cleaner.
+
+--- Full Description (Max 4000 characters) ---
+FileLensPro is a powerful, lightning-fast file search, document scanner, and duplicate file management tool built for Android.
+
+KEY FEATURES:
+
+🔍 Instant Offline File Search:
+Search documents, images, PDFs, Excel sheets, and files by name, type, date, or size with instant real-time results.
+
+📄 On-Device OCR (Optical Character Recognition):
+Extract text directly from images, scans, and documents offline. Supports English and Devanagari (Hindi) scripts.
+
+✨ Hindi Transliteration & KrutiDev Support:
+Search Devanagari text using phonetic English typing and easily convert legacy KrutiDev fonts to Unicode.
+
+📑 PDF & Document Viewer:
+Quickly preview PDFs, Word documents (.docx), Excel sheets (.xlsx), and text files right inside the app without external viewers.
+
+🧹 Duplicate File Finder:
+Scan your device to find exact duplicates and free up valuable storage space safely.
+
+🔒 100% Privacy Focused:
+All searches, OCR extractions, and file operations run locally on your device. Your personal data and documents never leave your phone.
+
+--- Category & Tags ---
+Primary Category : Productivity (or Tools)
+Tags             : File Manager, OCR, Tools, Productivity, Search
+
+================================================================================
+STEP 3: GRAPHICS & ASSETS SPECIFICATIONS
+================================================================================
+
+1. App Icon:
+   - Size: 512 x 512 px
+   - Format: 32-bit PNG (with alpha)
+   - Max file size: 1 MB
+
+2. Feature Graphic:
+   - Size: 1024 x 500 px
+   - Format: JPG or 24-bit PNG (no alpha/transparency)
+   - Max file size: 15 MB
+
+3. Phone Screenshots:
+   - Minimum: 2 screenshots (Recommended: 4 to 8)
+   - Format: JPEG or 24-bit PNG (no alpha)
+   - Dimensions: Between 320 px and 3840 px (16:9 or 9:16 aspect ratio, e.g. 1080 x 1920 or 1080 x 2400)
+
+4. Tablet Screenshots (Optional but recommended if targeting tablets):
+   - 7-inch tablet: At least 1 screenshot (1080 x 1920 or similar)
+   - 10-inch tablet: At least 1 screenshot (1200 x 1920 or similar)
+
+================================================================================
+STEP 4: APP CONTENT & POLICY QUESTIONNAIRES (IN GOOGLE PLAY CONSOLE)
+================================================================================
+
+Navigate to: Policy and programs -> App content
+
+1. Privacy Policy:
+   - Paste URL: https://narendragd999.github.io/FileLensScanner/privacy.html
+
+2. App Access:
+   - Select: "All functionality is available without special access"
+
+3. Ads:
+   - Select: "No, my app does not contain ads" (unless AdMob is added)
+
+4. Content Rating (IARC Questionnaire):
+   - Enter your developer contact email.
+   - Category: Utility, Productivity, Communication, or Other.
+   - Answer "No" to violence, sexual content, profanity, drug use, gambling, etc.
+   - Result: Rating will be Everyone (3+). Click Save and Submit.
+
+5. Target Audience and Content:
+   - Target Age: 18 and over (and/or 13-17).
+   - Could the app appeal to children?: Select "No".
+
+6. News Apps / COVID-19 / Financial Features / Government Apps:
+   - Select "No" to each of these declarations.
+
+7. Data Safety Form:
+   - Does your app collect or share user data?: Select "No" (app operates offline, local OCR).
+   - State that all processing occurs on-device and no user files are transmitted externally.
+
+8. All Files Access Permission (MANAGE_EXTERNAL_STORAGE):
+   - Core Feature Selection: File management / File search / Storage cleaner.
+   - Explanation Text (Copy & Paste):
+     FileLensPro is a comprehensive local file manager, instant offline document search engine, and duplicate file cleaner. To enable users to index, locate documents across all folders, extract OCR text from scattered files, and identify duplicate media to reclaim storage space, full file system access is essential to the core functionality of the application.
+   - Video URL field:
+     https://youtube.com/shorts/FgSD-9TiLto?feature=share
+
+================================================================================
+STEP 5: UPLOAD & RELEASE APPS
+================================================================================
+
+1. For Personal Accounts created after Nov 13, 2023:
+   - Go to: Testing -> Closed testing -> Create track / Create new release.
+   - Run closed test with 20 opted-in testers for 14 continuous days.
+
+2. For Organization Accounts or Standard Production:
+   - Go to: Release -> Production -> Create new release.
+
+3. Upload the App Bundle:
+   - Click "Upload" and choose:
+     D:\Antigravity\FileLensProTestBundle\android\app\build\outputs\bundle\release\app-release.aab
+
+4. Release Name:
+   - 1.0.0 (2)
+
+5. Release Notes (Copy & Paste):
+   Release v1.0.0 (version 2) of FileLensPro:
+   - Lightning-fast offline file search across device storage
+   - On-device English & Hindi OCR text extraction
+   - Built-in PDF & document viewer
+   - Duplicate file scanner to free up space
+
+6. Review & Rollout:
+   - Click "Next" -> "Review release" -> "Save" -> "Start rollout to Production" (or Closed testing).
+
+================================================================================
+STEP 6: ORIGINAL PLAY STORE KEYSTORE DETAILS (VERIFIED)
+================================================================================
+
+Keystore Location   : D:\Antigravity\FileLensProTestBundle\android\app\my-upload-key.keystore
+Key Alias           : my-key-alias
+Store Password      : Narendra@1254
+Key Password        : Narendra@1254
+Owner & Issuer      : CN=Narendra Dangi, OU=Individual, O=FileLensPro, L=Salumbar, ST=Rajasthan, C=91
+Certificate SHA1    : E8:12:67:5B:07:B4:38:C2:F1:3A:2A:76:43:18:5E:BD:63:B3:DE:EE
+Certificate SHA256  : 2B:0E:C8:0E:76:18:59:10:D9:A5:B0:CF:E5:97:6D:E7:C4:DB:DE:EA:F5:AA:18:1F:59:7D:8E:21:1A:F7:6F:6F
+Validity            : Mon Aug 17 11:41:06 IST 2026 until Fri Jan 02 11:41:06 IST 2054
+================================================================================

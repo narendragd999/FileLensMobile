@@ -1,0 +1,26 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Centered Document outline with search lens for Material You dynamic theming -->
+    <group
+        android:translateX="18"
+        android:translateY="18">
+        <!-- Document page silhouette -->
+        <path
+            android:fillColor="#FFFFFFFF"
+            android:pathData="M18,6 C14.69,6 12,8.69 12,12 L12,60 C12,63.31 14.69,66 18,66 L54,66 C57.31,66 60,63.31 60,60 L60,22 L44,6 L18,6 Z M18,12 L40,12 L40,24 L54,24 L54,60 L18,60 L18,12 Z"/>
+        <!-- Document lines -->
+        <path
+            android:fillColor="#FFFFFFFF"
+            android:pathData="M24,32 L48,32 L48,36 L24,36 Z"/>
+        <path
+            android:fillColor="#FFFFFFFF"
+            android:pathData="M24,42 L42,42 L42,46 L24,46 Z"/>
+        <!-- Search Lens -->
+        <path
+            android:fillColor="#FFFFFFFF"
+            android:pathData="M49,37 C43.48,37 39,41.48 39,47 C39,52.52 43.48,57 49,57 C51.41,57 53.62,56.14 55.34,54.71 L62.29,61.66 C62.68,62.05 63.31,62.05 63.7,61.66 C64.09,61.27 64.09,60.64 63.7,60.25 L56.71,53.34 C58.14,51.62 59,49.41 59,47 C59,41.48 54.52,37 49,37 Z M49,41 C52.31,41 55,43.69 55,47 C55,50.31 52.31,53 49,53 C45.69,53 43,50.31 43,47 C43,43.69 45.69,41 49,41 Z"/>
+    </group>
+</vector>

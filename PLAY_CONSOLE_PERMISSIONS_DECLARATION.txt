@@ -1,0 +1,104 @@
+﻿================================================================================
+   GOOGLE PLAY CONSOLE - PERMISSIONS & DECLARATIONS (COPY & PASTE READY)
+                           FOR FILELENSPRO
+================================================================================
+
+App Type     : Fast File Search, On-Device OCR, Document & Media Management
+App Package  : com.filelenspro.app
+Version Code : 2
+
+================================================================================
+SECTION 1: PHOTO AND VIDEO PERMISSIONS
+================================================================================
+
+1. READ_MEDIA_IMAGES (Photos/Images Permission):
+-------------------------------------------------
+Copy and paste into: "Describe your app's use of the READ_MEDIA_IMAGES permission"
+
+FileLensPro is an offline file search engine and on-device document OCR application. The READ_MEDIA_IMAGES permission is essential for its core functionality:
+1. On-Device OCR: Extracting text from document photos, receipts, invoices, and scanned images locally on the device (supporting English & Hindi).
+2. Instant Document Search: Indexing and searching image files across device storage by name, metadata, and extracted text.
+3. In-App Document Preview: Allowing users to view scanned documents directly inside the app.
+
+All image processing and OCR text extraction occur 100% locally on the user's device and are never uploaded to any external server.
+
+
+2. READ_MEDIA_VIDEO (Video Permission):
+----------------------------------------
+Copy and paste into: "Describe your app's use of the READ_MEDIA_VIDEO permission"
+
+The READ_MEDIA_VIDEO permission is required for FileLensPro's core offline search and file management features:
+1. Video Search & Indexing: Enabling users to instantly search, filter, and sort video files across all device folders by name, format, date, and file size.
+2. In-App Media Management: Allowing users to locate, preview, and organize video files stored across different directories.
+
+All video file operations run completely offline and locally on the device without transmitting any media data externally.
+
+
+3. "Why can't you use the system Photo Picker?":
+------------------------------------------------
+Copy and paste if asked:
+
+The system Photo Picker requires manual, single-item user selection. FileLensPro is an automated search and indexing tool that requires batch access to index document images and media files across storage for instant search and offline OCR text extraction.
+
+
+================================================================================
+SECTION 2: ALL FILES ACCESS (MANAGE_EXTERNAL_STORAGE)
+================================================================================
+
+1. Core Feature Selection:
+--------------------------
+Select: File management / File search / Storage cleaner
+
+2. Justification Description:
+------------------------------
+FileLensPro is a comprehensive local file manager and instant offline document search engine. To enable users to index, locate documents (PDFs, Excel, Word, Text, and Media files) across all folders and extract OCR text from scattered files, full file system access is essential to the core functionality of the application.
+
+3. Video Proof / Demonstration Link:
+------------------------------------
+https://youtube.com/shorts/FgSD-9TiLto?feature=share
+
+
+================================================================================
+SECTION 3: PRIVACY & DATA SAFETY
+================================================================================
+
+1. Privacy Policy URL:
+-----------------------
+https://narendragd999.github.io/FileLensScanner/privacy.html
+
+2. Data Safety Answers:
+-----------------------
+- Does your app collect or share user data?: No
+- Does your app upload files to any cloud?: No (All processing is strictly on-device)
+- Is data encrypted in transit?: N/A (Offline application)
+
+================================================================================
+SECTION 4: STORE LISTING COPY
+================================================================================
+
+App Title (30 chars max):
+FileLensPro - Search & OCR
+
+Short Description (80 chars max):
+Fast offline file search, document OCR, Hindi/English indexing & duplicate cleaner.
+
+Full Description:
+FileLensPro is a powerful, lightning-fast file search, document scanner, and duplicate file management tool built for Android.
+
+KEY FEATURES:
+
+🔍 Instant Offline File Search:
+Search documents, images, PDFs, Excel sheets, videos, and files by name, type, date, or size with instant real-time results.
+
+📄 On-Device OCR (Optical Character Recognition):
+Extract text directly from images, scans, and documents offline. Supports English and Devanagari (Hindi) scripts.
+
+✨ Hindi Transliteration & KrutiDev Support:
+Search Devanagari text using phonetic English typing and easily convert legacy KrutiDev fonts to Unicode.
+
+📑 PDF & Document Viewer:
+Quickly preview PDFs, Word documents (.docx), Excel sheets (.xlsx), and text files right inside the app without external viewers.
+
+🔒 100% Privacy Focused:
+All searches, OCR extractions, and file operations run locally on your device. Your personal data and documents never leave your phone.
+================================================================================
