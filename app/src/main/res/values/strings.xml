@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">FileSearchPro</string>
+    <string name="tab_scans_docs">Scans &amp; Docs</string>
+    <string name="tab_brain">Brain</string>
+    <string name="tab_search">Search</string>
+    <string name="tab_cards">Cards</string>
+    <string name="tab_settings">Settings</string>
+    <string name="search_placeholder">Search files, OCR text, IDs, bills…</string>
+    <string name="empty_search_title">Index &amp; Search Offline</string>
+    <string name="empty_search_subtitle">Add PDFs, photos, documents, or folders to extract text on-device with ML Kit OCR and search in milliseconds.</string>
+    <string name="privacy_badge">100% On-Device · Zero Cloud · Private</string>
+</resources>
