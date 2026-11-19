@@ -10,4 +10,11 @@
     <string name="empty_search_title">Index &amp; Search Offline</string>
     <string name="empty_search_subtitle">Add PDFs, photos, documents, or folders to extract text on-device with ML Kit OCR and search in milliseconds.</string>
     <string name="privacy_badge">100% On-Device · Zero Cloud · Private</string>
+    <string name="widget_name">FileSearchPro Quick Bar</string>
+    <string name="shortcut_search_short">Search</string>
+    <string name="shortcut_search_long">Search Offline Files</string>
+    <string name="shortcut_scan_short">Live Scan</string>
+    <string name="shortcut_scan_long">Fast Document Scanner</string>
+    <string name="shortcut_schedule_short">New Task</string>
+    <string name="shortcut_schedule_long">Schedule Second Brain Task</string>
 </resources>

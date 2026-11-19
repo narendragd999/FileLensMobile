@@ -4,9 +4,9 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.fragment.app.FragmentActivity
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -24,6 +24,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.CreditCard
 import androidx.compose.material.icons.rounded.Description
@@ -36,8 +37,6 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
-import androidx.compose.material3.SnackbarHost
-import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -52,6 +51,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.testTag
@@ -65,7 +65,10 @@ import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.toRoute
 import com.filelenspro.app.domain.engine.SmartTaxonomy
+import com.filelenspro.app.ui.components.BiometricLockOverlay
 import com.filelenspro.app.ui.components.QuickNavSheet
+import com.filelenspro.app.ui.components.SmartToastEvent
+import com.filelenspro.app.ui.components.SmartToastHost
 import com.filelenspro.app.ui.components.TutorialDialog
 import com.filelenspro.app.ui.navigation.BookmarksRoute
 import com.filelenspro.app.ui.navigation.CardsRoute
@@ -102,9 +105,15 @@ import com.filelenspro.app.ui.viewmodel.SecondBrainViewModel
 import com.filelenspro.app.ui.viewmodel.SharedPayload
 import com.filelenspro.app.ui.viewmodel.ToolsViewModel
 
-class MainActivity : ComponentActivity() {
+class MainActivity : FragmentActivity() {
 
     private var latestIntentState by mutableStateOf<Intent?>(null)
+    private var resumeTick by mutableStateOf(0)
+
+    override fun onResume() {
+        super.onResume()
+        resumeTick++
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -117,21 +126,35 @@ class MainActivity : ComponentActivity() {
             val toolsViewModel: ToolsViewModel = viewModel()
 
             val prefs by searchViewModel.userPrefs.collectAsState()
-            val toastMsg by toolsViewModel.toastMessage.collectAsState()
+            val toastEvent by toolsViewModel.toastEvent.collectAsState()
             val pendingShare by searchViewModel.pendingSharePayload.collectAsState()
 
-            val snackbarHostState = remember { SnackbarHostState() }
-
-            LaunchedEffect(toastMsg) {
-                val msg = toastMsg
-                if (!msg.isNullOrBlank()) {
-                    snackbarHostState.showSnackbar(msg)
-                    toolsViewModel.clearToast()
+            LaunchedEffect(resumeTick) {
+                if (resumeTick > 0) {
+                    val newlyGranted = searchViewModel.refreshStoragePermission()
+                    toolsViewModel.refreshFolderRoots()
+                    if (newlyGranted) {
+                        toolsViewModel.postToast("All Files Access granted! Starting full-device incremental index…")
+                        searchViewModel.indexEntireDevice(forceReindex = false) { summary ->
+                            if (summary != null) {
+                                toolsViewModel.postToast(
+                                    "Indexed +${summary.newOrUpdated} files (${summary.skippedUnchanged} unchanged skipped)"
+                                )
+                            }
+                        }
+                    }
                 }
             }
 
+            var pendingDeepLinkHost by remember { mutableStateOf<String?>(null) }
+
             LaunchedEffect(latestIntentState) {
                 val incoming = latestIntentState ?: return@LaunchedEffect
+                if (incoming.action == Intent.ACTION_VIEW && incoming.data?.scheme == "filelenspro") {
+                    pendingDeepLinkHost = incoming.data?.host
+                    latestIntentState = null
+                    return@LaunchedEffect
+                }
                 if (incoming.action == Intent.ACTION_SEND || incoming.action == Intent.ACTION_SEND_MULTIPLE) {
                     val text = incoming.getStringExtra(Intent.EXTRA_TEXT)
                     val uris = mutableListOf<Uri>()
@@ -176,7 +199,11 @@ class MainActivity : ComponentActivity() {
                     brainViewModel = brainViewModel,
                     toolsViewModel = toolsViewModel,
                     isProActivated = prefs.isProActivated,
-                    snackbarHostState = snackbarHostState,
+                    biometricAppLock = prefs.biometricAppLock,
+                    pendingDeepLinkHost = pendingDeepLinkHost,
+                    onDeepLinkHandled = { pendingDeepLinkHost = null },
+                    toastEvent = toastEvent,
+                    onDismissToast = { toolsViewModel.clearToast() },
                     pendingShare = pendingShare,
                     onClearShare = { searchViewModel.setPendingShare(null) }
                 )
@@ -197,7 +224,11 @@ private fun FileLensRootShell(
     brainViewModel: SecondBrainViewModel,
     toolsViewModel: ToolsViewModel,
     isProActivated: Boolean,
-    snackbarHostState: SnackbarHostState,
+    biometricAppLock: Boolean,
+    pendingDeepLinkHost: String?,
+    onDeepLinkHandled: () -> Unit,
+    toastEvent: SmartToastEvent?,
+    onDismissToast: () -> Unit,
     pendingShare: SharedPayload?,
     onClearShare: () -> Unit
 ) {
@@ -208,6 +239,7 @@ private fun FileLensRootShell(
 
     var showQuickNav by remember { mutableStateOf(false) }
     var showTutorial by remember { mutableStateOf(false) }
+    var isAppUnlocked by remember { mutableStateOf(false) }
 
     val isMainTab = destination == null ||
         destination.hasRoute<DocumentsRoute>() ||
@@ -222,10 +254,26 @@ private fun FileLensRootShell(
         }
     }
 
+    LaunchedEffect(pendingDeepLinkHost) {
+        val host = pendingDeepLinkHost ?: return@LaunchedEffect
+        when (host.lowercase()) {
+            "search" -> navigateTop(SearchRoute)
+            "scan" -> navigateTop(DocScannerRoute(mode = "batch"))
+            "brain" -> navigateTop(SecondBrainRoute)
+            "brain_schedule" -> {
+                brainViewModel.openManualScheduleNote()
+                navigateTop(SecondBrainRoute)
+            }
+            "cards" -> navigateTop(CardsRoute)
+            "cleaner" -> navigateTop(FileAnalyserRoute)
+        }
+        onDeepLinkHandled()
+    }
+
+    Box(modifier = Modifier.fillMaxSize()) {
     Scaffold(
         containerColor = palette.bg,
         contentWindowInsets = WindowInsets(0, 0, 0, 0),
-        snackbarHost = { SnackbarHost(hostState = snackbarHostState) },
         bottomBar = {
             if (isMainTab) {
                 FileLensBottomNavBar(
@@ -265,13 +313,16 @@ private fun FileLensRootShell(
                 composable<SecondBrainRoute> {
                     SecondBrainScreen(
                         viewModel = brainViewModel,
+                        searchViewModel = searchViewModel,
                         toolsViewModel = toolsViewModel,
-                        onOpenQuickNav = { showQuickNav = true }
+                        onOpenQuickNav = { showQuickNav = true },
+                        onNavigate = { navigateTop(it) }
                     )
                 }
                 composable<CardsRoute> {
                     CardsScreen(
                         searchViewModel = searchViewModel,
+                        brainViewModel = brainViewModel,
                         toolsViewModel = toolsViewModel,
                         onOpenQuickNav = { showQuickNav = true },
                         onNavigate = { navigateTop(it) }
@@ -287,6 +338,7 @@ private fun FileLensRootShell(
                 }
                 composable<FileManagerRoute> {
                     FileManagerScreen(
+                        searchViewModel = searchViewModel,
                         toolsViewModel = toolsViewModel,
                         onBack = { navController.popBackStack() }
                     )
@@ -301,6 +353,7 @@ private fun FileLensRootShell(
                     val args = entry.toRoute<DocScannerRoute>()
                     DocScannerScreen(
                         initialMode = args.mode,
+                        appendToPdfUri = args.appendToPdfUri,
                         toolsViewModel = toolsViewModel,
                         onBack = { navController.popBackStack() }
                     )
@@ -311,6 +364,7 @@ private fun FileLensRootShell(
                         initialPdfUri = args.pdfUri,
                         initialFileName = args.fileName,
                         toolsViewModel = toolsViewModel,
+                        onScanAppend = { pdfUri -> navigateTop(DocScannerRoute(mode = "batch", appendToPdfUri = pdfUri)) },
                         onBack = { navController.popBackStack() }
                     )
                 }
@@ -320,7 +374,7 @@ private fun FileLensRootShell(
                         uri = args.uri,
                         title = args.title,
                         toolsViewModel = toolsViewModel,
-                        onOpenOrganizer = { navigateTop(PageOrganizerRoute(args.uri, args.title)) },
+                        onOpenOrganizer = { currentUri -> navigateTop(PageOrganizerRoute(currentUri, args.title)) },
                         onBack = { navController.popBackStack() }
                     )
                 }
@@ -360,6 +414,22 @@ private fun FileLensRootShell(
                     )
                 }
             }
+        }
+    }
+
+        // Top-anchored Smart Floating Toast (never hides bottom buttons or nav bars)
+        SmartToastHost(
+            event = toastEvent,
+            onDismiss = onDismissToast,
+            modifier = Modifier.align(Alignment.TopCenter)
+        )
+
+        if (biometricAppLock && !isAppUnlocked) {
+            BiometricLockOverlay(
+                title = "FileSearchPro Locked",
+                subtitle = "Authenticate with biometrics or device PIN to access your offline vault",
+                onUnlocked = { isAppUnlocked = true }
+            )
         }
     }
 
@@ -447,14 +517,19 @@ private fun FileLensBottomNavBar(
                 BottomTabItem("Docs", Icons.Rounded.Description, isDocs, "nav_tab_docs") { onSelect(DocumentsRoute) }
                 BottomTabItem("Brain", Icons.Rounded.Psychology, isBrain, "nav_tab_brain") { onSelect(SecondBrainRoute) }
 
-                // Elevated Cobalt Center Search Button
+                // Elevated Cobalt-Indigo Gradient Center Search Button
+                val centerBrush = if (isSearch) {
+                    Brush.linearGradient(listOf(palette.accentGradientStart, palette.accentGradientEnd))
+                } else {
+                    Brush.linearGradient(listOf(palette.surface2, palette.surface2))
+                }
                 Box(
                     modifier = Modifier
-                        .offset(y = (-8).dp)
-                        .size(56.dp)
-                        .shadow(8.dp, CircleShape)
+                        .offset(y = (-9).dp)
+                        .size(58.dp)
+                        .shadow(10.dp, CircleShape)
                         .clip(CircleShape)
-                        .background(if (isSearch) palette.accent else palette.surface2)
+                        .background(centerBrush)
                         .clickable { onSelect(SearchRoute) }
                         .testTag("nav_tab_search"),
                     contentAlignment = Alignment.Center
@@ -486,8 +561,9 @@ private fun BottomTabItem(
     val tint = if (selected) palette.accent else palette.muted
     Column(
         modifier = Modifier
-            .size(width = 62.dp, height = 52.dp)
-            .clip(CircleShape)
+            .size(width = 64.dp, height = 52.dp)
+            .clip(RoundedCornerShape(14.dp))
+            .background(if (selected) palette.accent.copy(alpha = 0.1f) else Color.Transparent)
             .clickable(onClick = onClick)
             .testTag(tag),
         horizontalAlignment = Alignment.CenterHorizontally,

@@ -83,7 +83,8 @@ data class VoiceNoteEntity(
     val linkedDocUri: String = "",
     val linkedDocName: String = "",
     val linkedDocType: String = "",
-    val createdAt: String
+    val createdAt: String,
+    val recurrenceRule: String = "none" // "none" | "daily" | "weekly" | "monthly" | "yearly"
 )
 
 @Entity(

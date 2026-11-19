@@ -172,7 +172,22 @@ data class LanguageOption(
 data class IndexProgress(
     val indexed: Int,
     val total: Int,
-    val currentFile: String
+    val currentFile: String,
+    val phase: String = "Indexing",
+    val skippedUnchanged: Int = 0,
+    val removedDeleted: Int = 0,
+    val isFullDevice: Boolean = false
+)
+
+data class DeviceIndexSummary(
+    val newOrUpdated: Int,
+    val skippedUnchanged: Int,
+    val removedDeleted: Int,
+    val totalScanned: Int,
+    val elapsedMs: Long,
+    val isFullDevice: Boolean,
+    val wasCancelled: Boolean = false,
+    val timestampIso: String
 )
 
 data class IndexStats(
@@ -187,3 +202,258 @@ data class IncomingIntentRecommendation(
     val confidence: Double,
     val suggestedTitle: String
 )
+
+enum class PhotoCompressPreset(
+    val id: String,
+    val label: String,
+    val subtitle: String,
+    val maxDimension: Int,
+    val quality: Int,
+    val estimatedRatio: Float
+) {
+    LOSSLESS_LOOK(
+        id = "lossless_look",
+        label = "Smart Lossless",
+        subtitle = "Zero visible loss · up to 2560px · WebP/JPEG 84%",
+        maxDimension = 2560,
+        quality = 84,
+        estimatedRatio = 0.36f
+    ),
+    MAX_QUALITY(
+        id = "max_quality",
+        label = "Studio Crisp",
+        subtitle = "Keep full resolution · metadata stripped · 90%",
+        maxDimension = 3840,
+        quality = 90,
+        estimatedRatio = 0.54f
+    ),
+    ULTRA_COMPACT(
+        id = "ultra_compact",
+        label = "Max Space",
+        subtitle = "Crisp 1920px HD · 76% adaptive compression",
+        maxDimension = 1920,
+        quality = 76,
+        estimatedRatio = 0.22f
+    )
+}
+
+data class PhotoCompressCandidate(
+    val id: Long,
+    val uri: String,
+    val name: String,
+    val sizeBytes: Long,
+    val width: Int,
+    val height: Int,
+    val modified: String,
+    val selected: Boolean = true,
+    val estimatedSavedBytes: Long = 0L
+)
+
+data class PhotoCompressSummary(
+    val processedCount: Int,
+    val skippedAlreadyOptimal: Int,
+    val originalTotalBytes: Long,
+    val compressedTotalBytes: Long,
+    val savedBytes: Long
+)
+
+enum class PdfPageSizePreset(val id: String, val label: String) {
+    AUTO("auto", "Auto Fit"),
+    A4("a4", "A4"),
+    LETTER("letter", "US Letter")
+}
+
+enum class PdfQualityPreset(val id: String, val label: String, val maxDim: Int, val jpegQuality: Float) {
+    HIGH("high", "High", 2400, 0.92f),
+    BALANCED("balanced", "Balanced", 1800, 0.82f),
+    COMPACT("compact", "Small PDF", 1400, 0.68f)
+}
+
+/**
+ * 4 normalized corners in [0f..1f] image coordinates:
+ * Top-Left, Top-Right, Bottom-Right, Bottom-Left.
+ */
+data class NormalizedQuad(
+    val tlX: Float = 0.08f,
+    val tlY: Float = 0.10f,
+    val trX: Float = 0.92f,
+    val trY: Float = 0.10f,
+    val brX: Float = 0.92f,
+    val brY: Float = 0.90f,
+    val blX: Float = 0.08f,
+    val blY: Float = 0.90f,
+    val confidence: Float = 0f
+) {
+    fun isFullFrame(): Boolean =
+        tlX <= 0.01f && tlY <= 0.01f &&
+            trX >= 0.99f && trY <= 0.01f &&
+            brX >= 0.99f && brY >= 0.99f &&
+            blX <= 0.01f && blY >= 0.99f
+
+    companion object {
+        val FULL = NormalizedQuad(0f, 0f, 1f, 0f, 1f, 1f, 0f, 1f, 0f)
+    }
+}
+
+enum class PdfCompressPreset(
+    val id: String,
+    val label: String,
+    val subtitle: String,
+    val maxDimension: Int,
+    val jpegQuality: Float,
+    val estimatedRatio: Float
+) {
+    EMAIL_SMALL(
+        id = "email_small",
+        label = "Email Ready",
+        subtitle = "Ultra-small · 1280px · 62% quality",
+        maxDimension = 1280,
+        jpegQuality = 0.62f,
+        estimatedRatio = 0.28f
+    ),
+    BALANCED(
+        id = "balanced",
+        label = "Balanced",
+        subtitle = "Sharp text & photos · 1700px · 76% quality",
+        maxDimension = 1700,
+        jpegQuality = 0.76f,
+        estimatedRatio = 0.45f
+    ),
+    PRINT_HIGH(
+        id = "print_high",
+        label = "Print High",
+        subtitle = "Crisp print detail · 2200px · 86% quality",
+        maxDimension = 2200,
+        jpegQuality = 0.86f,
+        estimatedRatio = 0.68f
+    )
+}
+
+data class PdfCompressCandidate(
+    val id: Long,
+    val uri: String,
+    val name: String,
+    val sizeBytes: Long,
+    val pageCount: Int,
+    val modified: String,
+    val selected: Boolean = true,
+    val estimatedSavedBytes: Long = 0L
+)
+
+data class PdfCompressSummary(
+    val processedCount: Int,
+    val skippedAlreadyOptimal: Int,
+    val originalTotalBytes: Long,
+    val compressedTotalBytes: Long,
+    val savedBytes: Long
+)
+
+/**
+ * Normalized placement of a signature stamp on a page/image.
+ * posX/posY represent the top-left corner in [0f..1f] page coordinates.
+ */
+data class SignaturePlacement(
+    val posX: Float = 0.60f,
+    val posY: Float = 0.78f,
+    val widthFraction: Float = 0.30f,
+    val includeDateStamp: Boolean = false
+)
+
+data class SavedSignatureItem(
+    val filePath: String,
+    val name: String,
+    val createdMs: Long
+)
+
+enum class ExpiryUrgency {
+    EXPIRED,
+    CRITICAL, // <= 30 days
+    UPCOMING, // <= 90 days
+    SAFE
+}
+
+data class ExpiryRadarItem(
+    val file: FileEntity,
+    val docType: String,
+    val expiryDateIso: String,
+    val daysRemaining: Long,
+    val urgency: ExpiryUrgency,
+    val matchedContext: String
+)
+
+enum class CleanerCategory(val label: String) {
+    OLD_DOWNLOADS("Old Downloads (90+d)"),
+    LEFTOVER_APKS("Leftover APKs"),
+    LARGE_VIDEOS("Large Videos")
+}
+
+data class CleanerFileItem(
+    val path: String,
+    val uri: String,
+    val name: String,
+    val sizeBytes: Long,
+    val modifiedMs: Long,
+    val category: CleanerCategory,
+    val selected: Boolean = false
+)
+
+@Serializable
+data class BackupVoiceNote(
+    val uri: String,
+    val title: String,
+    val rawTranscript: String,
+    val temporalClass: String,
+    val resolvedDatetime: String? = null,
+    val actionItemsJson: String = "[]",
+    val isReminderSet: Boolean = false,
+    val imageUrisJson: String = "[]",
+    val linkedDocUri: String = "",
+    val linkedDocName: String = "",
+    val linkedDocType: String = "",
+    val createdAt: String,
+    val recurrenceRule: String = "none"
+)
+
+@Serializable
+data class BackupBookmark(
+    val fileUri: String,
+    val fileName: String,
+    val extension: String = "",
+    val size: Long = 0,
+    val modified: String = "",
+    val tagsJson: String = "[]",
+    val createdAt: String
+)
+
+@Serializable
+data class BackupSavedSearch(
+    val query: String,
+    val mode: String = "partial",
+    val createdAt: String
+)
+
+@Serializable
+data class BackupCardTag(
+    val fileUri: String,
+    val isCard: Boolean,
+    val customTag: String
+)
+
+@Serializable
+data class BackupSignatureEntry(
+    val fileName: String,
+    val pngBase64: String
+)
+
+@Serializable
+data class BackupPayload(
+    val formatVersion: Int = 1,
+    val exportedAtIso: String,
+    val voiceNotes: List<BackupVoiceNote> = emptyList(),
+    val bookmarks: List<BackupBookmark> = emptyList(),
+    val savedSearches: List<BackupSavedSearch> = emptyList(),
+    val cardTags: List<BackupCardTag> = emptyList(),
+    val signatures: List<BackupSignatureEntry> = emptyList()
+)
+
+

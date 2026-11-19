@@ -54,6 +54,12 @@ class SearchViewModel(application: Application) : AndroidViewModel(application) 
 
     val isIndexing = indexer.isIndexing
     val indexProgress = indexer.progress
+    val lastIndexSummary = indexer.lastIndexSummary
+
+    private val _hasAllFilesPermission = MutableStateFlow(
+        com.filelenspro.app.util.StoragePermissionHelper.hasAllFilesAccess(app)
+    )
+    val hasAllFilesPermission: StateFlow<Boolean> = _hasAllFilesPermission.asStateFlow()
 
     val indexStats: StateFlow<IndexStats> = allFiles.combine(userPrefs) { files, _ ->
         IndexStats(
@@ -99,6 +105,28 @@ class SearchViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
+    fun refreshStoragePermission(): Boolean {
+        val wasGranted = _hasAllFilesPermission.value
+        val nowGranted = com.filelenspro.app.util.StoragePermissionHelper.hasAllFilesAccess(app)
+        _hasAllFilesPermission.value = nowGranted
+        return !wasGranted && nowGranted
+    }
+
+    fun indexEntireDevice(
+        forceReindex: Boolean = false,
+        onComplete: (com.filelenspro.app.data.model.DeviceIndexSummary?) -> Unit = {}
+    ) {
+        viewModelScope.launch {
+            val summary = indexer.indexEntireDevice(
+                ocrLanguage = userPrefs.value.ocrLanguage,
+                forceReindex = forceReindex
+            )
+            if (_searchQuery.value.isNotBlank()) triggerSearch(immediate = true)
+            com.filelenspro.app.widget.FileSearchWidgetProvider.requestRefresh(app)
+            onComplete(summary)
+        }
+    }
+
     fun syncIndex(forceReindex: Boolean = false, onComplete: (Int) -> Unit = {}) {
         viewModelScope.launch {
             val count = indexer.syncAndReindexAll(
@@ -106,6 +134,7 @@ class SearchViewModel(application: Application) : AndroidViewModel(application) 
                 forceReindex = forceReindex
             )
             if (_searchQuery.value.isNotBlank()) triggerSearch(immediate = true)
+            com.filelenspro.app.widget.FileSearchWidgetProvider.requestRefresh(app)
             onComplete(count)
         }
     }
@@ -224,6 +253,12 @@ class SearchViewModel(application: Application) : AndroidViewModel(application) 
     fun removeBookmark(fileUri: String) {
         viewModelScope.launch(Dispatchers.IO) {
             dao.deleteBookmarkByUri(fileUri)
+        }
+    }
+
+    fun restoreBookmark(bookmark: BookmarkEntity) {
+        viewModelScope.launch(Dispatchers.IO) {
+            dao.insertBookmark(bookmark.copy(id = 0L))
         }
     }
 

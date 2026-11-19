@@ -10,9 +10,12 @@ import com.filelenspro.app.data.db.FileChunkEntity
 import com.filelenspro.app.data.db.FileEntity
 import com.filelenspro.app.data.db.FileLensDao
 import com.filelenspro.app.data.db.IndexTargetEntity
+import com.filelenspro.app.data.model.DeviceIndexSummary
 import com.filelenspro.app.data.model.IndexProgress
 import com.filelenspro.app.domain.engine.EmbeddingEngine
 import com.filelenspro.app.domain.engine.SmartTaxonomy
+import com.filelenspro.app.util.FormatUtils
+import com.filelenspro.app.util.StoragePermissionHelper
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -29,24 +32,69 @@ import java.io.File
 import java.io.FileOutputStream
 import java.security.MessageDigest
 import java.time.Instant
+import java.util.ArrayDeque
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.zip.ZipInputStream
+import kotlin.coroutines.coroutineContext
 
 class DocumentIndexer(
     private val context: Context,
     private val dao: FileLensDao,
     private val engine: OcrAndPdfEngine
 ) {
+    companion object {
+        private val INDEXABLE_EXTENSIONS = setOf(
+            "pdf",
+            "jpg", "jpeg", "png", "webp", "bmp",
+            "txt", "md", "csv", "json", "xml", "log", "html", "htm", "rtf",
+            "doc", "docx", "xls", "xlsx", "ppt", "pptx"
+        )
+
+        private val IMAGE_EXTENSIONS = setOf("jpg", "jpeg", "png", "webp", "bmp")
+
+        private val OFFICE_ZIP_EXTENSIONS = setOf("docx", "xlsx", "pptx")
+
+        private val SKIPPED_DIR_NAMES = setOf(
+            "android",
+            ".thumbnails",
+            ".trash",
+            ".trashbin",
+            ".cache",
+            "cache",
+            "temp",
+            "tmp",
+            "lost+found",
+            "alarms",
+            "ringtones",
+            "notifications",
+            "podcasts",
+            "audiobooks",
+            "music",
+            "movies"
+        )
+
+        private const val MAX_DEVICE_FILE_SIZE_BYTES = 40L * 1024L * 1024L // 40 MB
+        private const val MAX_DEVICE_SCAN_FILES = 5000
+    }
+
     private val _isIndexing = MutableStateFlow(false)
     val isIndexing: StateFlow<Boolean> = _isIndexing.asStateFlow()
 
     private val _progress = MutableStateFlow<IndexProgress?>(null)
     val progress: StateFlow<IndexProgress?> = _progress.asStateFlow()
 
+    private val _lastIndexSummary = MutableStateFlow<DeviceIndexSummary?>(null)
+    val lastIndexSummary: StateFlow<DeviceIndexSummary?> = _lastIndexSummary.asStateFlow()
+
+    private val cancelRequested = AtomicBoolean(false)
+
     @Volatile
     private var currentJob: Job? = null
 
     fun cancel() {
+        cancelRequested.set(true)
         currentJob?.cancel()
         _isIndexing.value = false
         _progress.value = null
@@ -61,6 +109,8 @@ class DocumentIndexer(
         isScanned: Boolean = false
     ): List<FileEntity> = withContext(Dispatchers.IO) {
         if (uris.isEmpty()) return@withContext emptyList()
+        cancelRequested.set(false)
+        currentJob = coroutineContext[Job]
         _isIndexing.value = true
         FileLensBackgroundService.start(context, "Indexing Documents", "Preparing ${uris.size} files...")
 
@@ -72,11 +122,22 @@ class DocumentIndexer(
                 val jobs = uris.map { uri ->
                     async {
                         semaphore.withPermit {
+                            if (cancelRequested.get()) return@withPermit null
                             val name = resolveDisplayName(uri)
-                            _progress.value = IndexProgress(completed.get(), uris.size, name)
+                            _progress.value = IndexProgress(
+                                indexed = completed.get(),
+                                total = uris.size,
+                                currentFile = name,
+                                phase = "Indexing Picked Files"
+                            )
                             val saved = indexSingleUri(uri, ocrLanguage, isCard, customTag, isScanned)
                             val doneCount = completed.incrementAndGet()
-                            _progress.value = IndexProgress(doneCount, uris.size, name)
+                            _progress.value = IndexProgress(
+                                indexed = doneCount,
+                                total = uris.size,
+                                currentFile = name,
+                                phase = "Indexing Picked Files"
+                            )
                             FileLensBackgroundService.update(
                                 context,
                                 "FileSearchPro Indexing",
@@ -92,6 +153,7 @@ class DocumentIndexer(
             }
         } catch (_: CancellationException) {
         } finally {
+            currentJob = null
             _isIndexing.value = false
             _progress.value = null
             FileLensBackgroundService.stop(context)
@@ -121,26 +183,274 @@ class DocumentIndexer(
     }
 
     /**
-     * Automatically discovers new or modified files across app vault folders
-     * (`ScannedDocs`, `SmartCards`, `IndexedDocs`, `VoiceNotes`) and persisted SAF folders,
-     * removes deleted vault entries, and incrementally indexes/re-indexes changed items.
+     * Full-device incremental indexing engine.
+     * Walks `/storage/emulated/0` (requires All Files Access) + App Vault + SAF folders,
+     * prunes deleted records, skips unchanged files via size + lastModified comparison,
+     * and processes only newly added or modified documents in parallel.
+     */
+    suspend fun indexEntireDevice(
+        ocrLanguage: String = "eng+hin",
+        forceReindex: Boolean = false
+    ): DeviceIndexSummary? = withContext(Dispatchers.IO) {
+        if (!StoragePermissionHelper.hasAllFilesAccess(context)) return@withContext null
+        if (_isIndexing.value) return@withContext null
+
+        val startMs = System.currentTimeMillis()
+        cancelRequested.set(false)
+        currentJob = coroutineContext[Job]
+        _isIndexing.value = true
+
+        var removedDeleted = 0
+        var skippedUnchanged = 0
+        var newOrUpdatedCount = 0
+        var totalScanned = 0
+        var wasCancelled = false
+
+        try {
+            FileLensBackgroundService.start(
+                context,
+                if (forceReindex) "Full Device Re-Index" else "Entire Device Incremental Index",
+                "Scanning device storage..."
+            )
+            _progress.value = IndexProgress(
+                indexed = 0,
+                total = 0,
+                currentFile = "Scanning device folders…",
+                phase = "Scanning Device Storage",
+                isFullDevice = true
+            )
+
+            val existingByUri = dao.getAllFiles().associateBy { it.uri }
+
+            // Phase 1: Prune deleted file:// records from index
+            existingByUri.values.forEach { entity ->
+                if (cancelRequested.get()) throw CancellationException()
+                if (entity.uri.startsWith("file://")) {
+                    val local = FormatUtils.resolveLocalFile(entity.uri)
+                    if (local == null || !local.exists()) {
+                        dao.deleteFileById(entity.id)
+                        removedDeleted++
+                    }
+                }
+            }
+
+            // Phase 2: Discover all indexable files across device storage + vault
+            data class FileCandidate(val file: File, val isCard: Boolean, val isScanned: Boolean)
+
+            val discoveredByPath = LinkedHashMap<String, FileCandidate>()
+
+            // 2a. App vault folders (preserve isCard / isScanned metadata)
+            val vaultFolders = listOf(
+                Triple(File(context.filesDir, "ScannedDocs"), false, true),
+                Triple(File(context.filesDir, "SmartCards"), true, true),
+                Triple(File(context.filesDir, "IndexedDocs"), false, false),
+                Triple(File(context.filesDir, "VoiceNotes"), false, false)
+            )
+            vaultFolders.forEach { (dir, isCard, isScanned) ->
+                if (dir.exists() && dir.isDirectory) {
+                    walkDirectoryIteratively(dir, MAX_DEVICE_SCAN_FILES) { file ->
+                        if (isIndexableFile(file)) {
+                            discoveredByPath[file.absolutePath] = FileCandidate(file, isCard, isScanned)
+                        }
+                    }
+                }
+            }
+
+            // 2b. Entire device primary external storage (/storage/emulated/0)
+            val externalRoot = StoragePermissionHelper.getPrimaryStorageDirectory()
+            if (externalRoot.exists() && externalRoot.canRead()) {
+                var discoveredCounter = discoveredByPath.size
+                walkDirectoryIteratively(externalRoot, MAX_DEVICE_SCAN_FILES) { file ->
+                    if (isIndexableFile(file) && !discoveredByPath.containsKey(file.absolutePath)) {
+                        discoveredByPath[file.absolutePath] = FileCandidate(file, isCard = false, isScanned = false)
+                        discoveredCounter++
+                        if (discoveredCounter % 25 == 0) {
+                            _progress.value = IndexProgress(
+                                indexed = 0,
+                                total = discoveredCounter,
+                                currentFile = file.name,
+                                phase = "Scanning Device ($discoveredCounter found)",
+                                removedDeleted = removedDeleted,
+                                isFullDevice = true
+                            )
+                        }
+                    }
+                }
+            }
+
+            // 2c. Persisted SAF folders
+            val safUris = mutableListOf<Uri>()
+            dao.getIndexTargets().forEach { target ->
+                if (cancelRequested.get()) throw CancellationException()
+                runCatching {
+                    val treeUri = Uri.parse(target.uri)
+                    collectSafDocumentUris(treeUri, DocumentsContract.getTreeDocumentId(treeUri), safUris, maxDepth = 4)
+                }
+            }
+
+            // Phase 3: Delta Comparison (skip unchanged files!)
+            val deltaLocal = mutableListOf<FileCandidate>()
+            discoveredByPath.values.forEach { candidate ->
+                if (cancelRequested.get()) throw CancellationException()
+                totalScanned++
+                val file = candidate.file
+                val uriStr = file.toUri().toString()
+                val existing = existingByUri[uriStr]
+                val modifiedIso = Instant.ofEpochMilli(file.lastModified()).toString()
+                val isUnchanged = !forceReindex &&
+                    existing != null &&
+                    existing.size == file.length() &&
+                    existing.modified == modifiedIso &&
+                    existing.ocrStatus != "pending"
+
+                if (isUnchanged) {
+                    skippedUnchanged++
+                } else {
+                    deltaLocal.add(candidate)
+                }
+            }
+
+            // Sort newest files first so recent docs, bills, and scans appear immediately
+            deltaLocal.sortByDescending { it.file.lastModified() }
+
+            val deltaSaf = safUris.filter { uri ->
+                totalScanned++
+                val existing = existingByUri[uri.toString()]
+                val unchanged = !forceReindex && existing != null && existing.ocrStatus != "pending"
+                if (unchanged) skippedUnchanged++
+                !unchanged
+            }
+
+            val totalDelta = deltaLocal.size + deltaSaf.size
+            val phaseLabel = if (forceReindex) "Full Re-Indexing" else "Incremental Indexing"
+
+            if (totalDelta > 0) {
+                FileLensBackgroundService.update(
+                    context,
+                    phaseLabel,
+                    "Processing $totalDelta new/changed ($skippedUnchanged unchanged skipped)",
+                    0,
+                    totalDelta
+                )
+                val done = AtomicInteger(0)
+                val semaphore = Semaphore(3)
+                coroutineScope {
+                    val localJobs = deltaLocal.map { candidate ->
+                        async {
+                            semaphore.withPermit {
+                                if (cancelRequested.get()) return@withPermit false
+                                val res = indexLocalFile(
+                                    file = candidate.file,
+                                    displayName = candidate.file.name,
+                                    ocrLanguage = ocrLanguage,
+                                    isCard = candidate.isCard,
+                                    isScanned = candidate.isScanned
+                                )
+                                val d = done.incrementAndGet()
+                                _progress.value = IndexProgress(
+                                    indexed = d,
+                                    total = totalDelta,
+                                    currentFile = candidate.file.name,
+                                    phase = phaseLabel,
+                                    skippedUnchanged = skippedUnchanged,
+                                    removedDeleted = removedDeleted,
+                                    isFullDevice = true
+                                )
+                                if (d % 5 == 0 || d == totalDelta) {
+                                    FileLensBackgroundService.update(
+                                        context,
+                                        phaseLabel,
+                                        "Indexed $d/$totalDelta · Skipped $skippedUnchanged unchanged",
+                                        d,
+                                        totalDelta
+                                    )
+                                }
+                                res != null
+                            }
+                        }
+                    }
+                    val safJobs = deltaSaf.map { uri ->
+                        async {
+                            semaphore.withPermit {
+                                if (cancelRequested.get()) return@withPermit false
+                                val res = indexSingleUri(uri, ocrLanguage = ocrLanguage)
+                                val d = done.incrementAndGet()
+                                _progress.value = IndexProgress(
+                                    indexed = d,
+                                    total = totalDelta,
+                                    currentFile = resolveDisplayName(uri),
+                                    phase = phaseLabel,
+                                    skippedUnchanged = skippedUnchanged,
+                                    removedDeleted = removedDeleted,
+                                    isFullDevice = true
+                                )
+                                res != null
+                            }
+                        }
+                    }
+                    newOrUpdatedCount = (localJobs + safJobs).awaitAll().count { it }
+                }
+            }
+        } catch (_: CancellationException) {
+            wasCancelled = true
+        } catch (_: Exception) {
+        } finally {
+            val summary = DeviceIndexSummary(
+                newOrUpdated = newOrUpdatedCount,
+                skippedUnchanged = skippedUnchanged,
+                removedDeleted = removedDeleted,
+                totalScanned = totalScanned,
+                elapsedMs = (System.currentTimeMillis() - startMs).coerceAtLeast(1L),
+                isFullDevice = true,
+                wasCancelled = wasCancelled,
+                timestampIso = Instant.now().toString()
+            )
+            _lastIndexSummary.value = summary
+            currentJob = null
+            _isIndexing.value = false
+            _progress.value = null
+            FileLensBackgroundService.stop(context)
+        }
+        _lastIndexSummary.value
+    }
+
+    /**
+     * Automatically discovers new or modified files across device storage (if All Files Access is granted),
+     * app vault folders (`ScannedDocs`, `SmartCards`, `IndexedDocs`, `VoiceNotes`), and persisted SAF folders,
+     * removes deleted entries, and incrementally indexes/re-indexes changed items.
      */
     suspend fun syncAndReindexAll(
         ocrLanguage: String = "eng+hin",
         forceReindex: Boolean = false
     ): Int = withContext(Dispatchers.IO) {
+        if (StoragePermissionHelper.hasAllFilesAccess(context)) {
+            val summary = indexEntireDevice(ocrLanguage = ocrLanguage, forceReindex = forceReindex)
+            return@withContext summary?.newOrUpdated ?: 0
+        }
+
         if (_isIndexing.value) return@withContext 0
+        val startMs = System.currentTimeMillis()
+        cancelRequested.set(false)
+        currentJob = coroutineContext[Job]
         _isIndexing.value = true
+
         var syncedCount = 0
+        var skippedUnchanged = 0
+        var removedDeleted = 0
+        var totalScanned = 0
+        var wasCancelled = false
+
         try {
             val existingByUri = dao.getAllFiles().associateBy { it.uri }
 
             // 1. Clean up missing local vault records
             existingByUri.values.forEach { entity ->
+                if (cancelRequested.get()) throw CancellationException()
                 if (entity.uri.startsWith("file://")) {
-                    val local = com.filelenspro.app.util.FormatUtils.resolveLocalFile(entity.uri)
+                    val local = FormatUtils.resolveLocalFile(entity.uri)
                     if (local == null || !local.exists()) {
                         dao.deleteFileById(entity.id)
+                        removedDeleted++
                     }
                 }
             }
@@ -156,12 +466,19 @@ class DocumentIndexer(
             vaultFolders.forEach { (dir, isCard, isScanned) ->
                 if (dir.exists()) {
                     dir.walkTopDown().filter { it.isFile && !it.name.startsWith(".") }.forEach { f ->
+                        if (cancelRequested.get()) throw CancellationException()
+                        totalScanned++
                         val uriStr = f.toUri().toString()
                         val existing = existingByUri[uriStr]
-                        val needsIndex = forceReindex || existing == null ||
-                            existing.size != f.length() ||
-                            existing.ocrStatus == "pending"
-                        if (needsIndex) {
+                        val modifiedIso = Instant.ofEpochMilli(f.lastModified()).toString()
+                        val isUnchanged = !forceReindex &&
+                            existing != null &&
+                            existing.size == f.length() &&
+                            existing.modified == modifiedIso &&
+                            existing.ocrStatus != "pending"
+                        if (isUnchanged) {
+                            skippedUnchanged++
+                        } else {
                             localCandidates.add(Triple(f, isCard, isScanned))
                         }
                     }
@@ -171,25 +488,31 @@ class DocumentIndexer(
             // 3. Collect new/modified files from persisted SAF folders
             val safUris = mutableListOf<Uri>()
             dao.getIndexTargets().forEach { target ->
+                if (cancelRequested.get()) throw CancellationException()
                 runCatching {
                     val treeUri = Uri.parse(target.uri)
                     collectSafDocumentUris(treeUri, DocumentsContract.getTreeDocumentId(treeUri), safUris, maxDepth = 4)
                 }
             }
             val newSafUris = safUris.filter { uri ->
+                totalScanned++
                 val existing = existingByUri[uri.toString()]
-                forceReindex || existing == null || existing.ocrStatus == "pending"
+                val unchanged = !forceReindex && existing != null && existing.ocrStatus != "pending"
+                if (unchanged) skippedUnchanged++
+                !unchanged
             }
 
             val total = localCandidates.size + newSafUris.size
             if (total > 0) {
-                FileLensBackgroundService.start(context, "Auto-Syncing Index", "Scanning $total new or updated files...")
+                val phase = if (forceReindex) "Re-Indexing Vault" else "Incremental Sync"
+                FileLensBackgroundService.start(context, phase, "Scanning $total new or updated files...")
                 val done = AtomicInteger(0)
                 val semaphore = Semaphore(3)
                 coroutineScope {
                     val localJobs = localCandidates.map { (file, isCard, isScanned) ->
                         async {
                             semaphore.withPermit {
+                                if (cancelRequested.get()) return@withPermit false
                                 val res = indexLocalFile(
                                     file = file,
                                     displayName = file.name,
@@ -198,7 +521,15 @@ class DocumentIndexer(
                                     isScanned = isScanned
                                 )
                                 val d = done.incrementAndGet()
-                                _progress.value = IndexProgress(d, total, file.name)
+                                _progress.value = IndexProgress(
+                                    indexed = d,
+                                    total = total,
+                                    currentFile = file.name,
+                                    phase = phase,
+                                    skippedUnchanged = skippedUnchanged,
+                                    removedDeleted = removedDeleted,
+                                    isFullDevice = false
+                                )
                                 res != null
                             }
                         }
@@ -206,9 +537,18 @@ class DocumentIndexer(
                     val safJobs = newSafUris.map { uri ->
                         async {
                             semaphore.withPermit {
+                                if (cancelRequested.get()) return@withPermit false
                                 val res = indexSingleUri(uri, ocrLanguage = ocrLanguage)
                                 val d = done.incrementAndGet()
-                                _progress.value = IndexProgress(d, total, resolveDisplayName(uri))
+                                _progress.value = IndexProgress(
+                                    indexed = d,
+                                    total = total,
+                                    currentFile = resolveDisplayName(uri),
+                                    phase = phase,
+                                    skippedUnchanged = skippedUnchanged,
+                                    removedDeleted = removedDeleted,
+                                    isFullDevice = false
+                                )
                                 res != null
                             }
                         }
@@ -216,8 +556,21 @@ class DocumentIndexer(
                     syncedCount = (localJobs + safJobs).awaitAll().count { it }
                 }
             }
+        } catch (_: CancellationException) {
+            wasCancelled = true
         } catch (_: Exception) {
         } finally {
+            _lastIndexSummary.value = DeviceIndexSummary(
+                newOrUpdated = syncedCount,
+                skippedUnchanged = skippedUnchanged,
+                removedDeleted = removedDeleted,
+                totalScanned = totalScanned,
+                elapsedMs = (System.currentTimeMillis() - startMs).coerceAtLeast(1L),
+                isFullDevice = false,
+                wasCancelled = wasCancelled,
+                timestampIso = Instant.now().toString()
+            )
+            currentJob = null
             _isIndexing.value = false
             _progress.value = null
             FileLensBackgroundService.stop(context)
@@ -225,15 +578,49 @@ class DocumentIndexer(
         syncedCount
     }
 
+    private fun walkDirectoryIteratively(root: File, maxFiles: Int, onFile: (File) -> Unit) {
+        val stack = ArrayDeque<File>()
+        stack.add(root)
+        var yielded = 0
+        while (stack.isNotEmpty() && yielded < maxFiles) {
+            if (cancelRequested.get()) throw CancellationException()
+            val dir = stack.removeLast()
+            val children = dir.listFiles() ?: continue
+            for (child in children) {
+                if (cancelRequested.get()) throw CancellationException()
+                val name = child.name
+                if (name.startsWith(".")) continue
+                if (child.isDirectory) {
+                    val lower = name.lowercase(Locale.ROOT)
+                    if (lower !in SKIPPED_DIR_NAMES) {
+                        stack.add(child)
+                    }
+                } else if (child.isFile) {
+                    onFile(child)
+                    yielded++
+                    if (yielded >= maxFiles) break
+                }
+            }
+        }
+    }
+
+    private fun isIndexableFile(file: File): Boolean {
+        if (!file.isFile || !file.canRead()) return false
+        val len = file.length()
+        if (len <= 0L || len > MAX_DEVICE_FILE_SIZE_BYTES) return false
+        val ext = file.extension.lowercase(Locale.ROOT)
+        return ext in INDEXABLE_EXTENSIONS
+    }
+
     private fun collectSafDocumentUris(treeUri: Uri, parentDocId: String, out: MutableList<Uri>, maxDepth: Int, depth: Int = 0) {
-        if (depth > maxDepth || out.size >= 400) return
+        if (depth > maxDepth || out.size >= 400 || cancelRequested.get()) return
         val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentDocId)
         val projection = arrayOf(
             DocumentsContract.Document.COLUMN_DOCUMENT_ID,
             DocumentsContract.Document.COLUMN_MIME_TYPE
         )
         context.contentResolver.query(childrenUri, projection, null, null, null)?.use { cursor ->
-            while (cursor.moveToNext() && out.size < 400) {
+            while (cursor.moveToNext() && out.size < 400 && !cancelRequested.get()) {
                 val docId = cursor.getString(0) ?: continue
                 val mime = cursor.getString(1) ?: ""
                 if (mime == DocumentsContract.Document.MIME_TYPE_DIR) {
@@ -306,14 +693,18 @@ class DocumentIndexer(
                     ocrStatus = "pending"
                 }
             }
-            "jpg", "jpeg", "png", "webp", "bmp" -> {
+            in IMAGE_EXTENSIONS -> {
                 val extracted = engine.extractTextFromImage(fileUri, ocrLanguage)
                 ocrText = extracted
                 ocrStatus = "done"
             }
-            "txt", "md", "csv", "json", "xml", "log", "html" -> {
+            "txt", "md", "csv", "json", "xml", "log", "html", "htm", "rtf" -> {
                 contentText = runCatching { file.readText().take(250_000) }.getOrNull()
                 ocrStatus = "done"
+            }
+            in OFFICE_ZIP_EXTENSIONS -> {
+                contentText = extractOfficeZipText(file)
+                ocrStatus = if (!contentText.isNullOrBlank()) "done" else "skipped"
             }
             else -> {
                 contentText = runCatching {
@@ -335,7 +726,7 @@ class DocumentIndexer(
             uri = fileUri,
             name = displayName,
             extension = ext,
-            fileType = if (ext in setOf("jpg", "jpeg", "png", "webp")) "image" else if (ext == "pdf") "pdf" else "document",
+            fileType = if (ext in IMAGE_EXTENSIONS) "image" else if (ext == "pdf") "pdf" else "document",
             size = file.length(),
             modified = Instant.ofEpochMilli(file.lastModified()).toString(),
             contentText = contentText,
@@ -353,6 +744,34 @@ class DocumentIndexer(
         val savedEntity = entity.copy(id = if (entity.id > 0) entity.id else rowId)
         rebuildEmbeddings(savedEntity)
         savedEntity
+    }
+
+    private fun extractOfficeZipText(file: File): String? {
+        if (file.length() > 15L * 1024L * 1024L) return null
+        return runCatching {
+            val sb = StringBuilder()
+            ZipInputStream(file.inputStream().buffered()).use { zis ->
+                var entry = zis.nextEntry
+                while (entry != null && sb.length < 180_000) {
+                    val n = entry.name.lowercase(Locale.ROOT)
+                    if (!entry.isDirectory && n.endsWith(".xml") &&
+                        (n.startsWith("word/document") || n.startsWith("xl/sharedstrings") || n.startsWith("ppt/slides/slide"))
+                    ) {
+                        val xml = zis.bufferedReader().readText()
+                        val cleaned = xml
+                            .replace(Regex("<[^>]+>"), " ")
+                            .replace(Regex("\\s+"), " ")
+                            .trim()
+                        if (cleaned.isNotBlank()) {
+                            sb.append(cleaned).append('\n')
+                        }
+                    }
+                    zis.closeEntry()
+                    entry = zis.nextEntry
+                }
+            }
+            sb.toString().trim().take(200_000).ifBlank { null }
+        }.getOrNull()
     }
 
     suspend fun rebuildEmbeddings(file: FileEntity) = withContext(Dispatchers.IO) {
@@ -424,4 +843,3 @@ class DocumentIndexer(
         }
     }
 }
-

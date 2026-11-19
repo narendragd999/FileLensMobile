@@ -85,6 +85,9 @@ interface FileLensDao {
     @Query("SELECT * FROM voice_notes ORDER BY id DESC")
     suspend fun getAllVoiceNotes(): List<VoiceNoteEntity>
 
+    @Query("SELECT * FROM voice_notes WHERE id = :id LIMIT 1")
+    suspend fun getVoiceNoteById(id: Long): VoiceNoteEntity?
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertVoiceNote(note: VoiceNoteEntity): Long
 
@@ -97,6 +100,9 @@ interface FileLensDao {
     // ─── Bookmarks ───
     @Query("SELECT * FROM bookmarks ORDER BY id DESC")
     fun observeBookmarks(): Flow<List<BookmarkEntity>>
+
+    @Query("SELECT * FROM bookmarks ORDER BY id DESC")
+    suspend fun getAllBookmarks(): List<BookmarkEntity>
 
     @Query("SELECT * FROM bookmarks WHERE fileUri = :uri LIMIT 1")
     suspend fun getBookmarkByUri(uri: String): BookmarkEntity?
@@ -113,6 +119,9 @@ interface FileLensDao {
     // ─── Saved Searches ───
     @Query("SELECT * FROM saved_searches ORDER BY id DESC")
     fun observeSavedSearches(): Flow<List<SavedSearchEntity>>
+
+    @Query("SELECT * FROM saved_searches ORDER BY id DESC")
+    suspend fun getAllSavedSearches(): List<SavedSearchEntity>
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertSavedSearch(search: SavedSearchEntity): Long

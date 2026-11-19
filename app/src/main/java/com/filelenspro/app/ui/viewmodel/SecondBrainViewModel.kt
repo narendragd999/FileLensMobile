@@ -8,11 +8,14 @@ import com.filelenspro.app.FileLensApplication
 import com.filelenspro.app.data.db.FileEntity
 import com.filelenspro.app.data.db.VoiceNoteEntity
 import com.filelenspro.app.data.model.ChecklistItem
+import com.filelenspro.app.data.model.ExpiryRadarItem
 import com.filelenspro.app.data.model.LanguageOption
 import com.filelenspro.app.data.model.TemporalExtractionResult
 import com.filelenspro.app.domain.engine.EmbeddingEngine
+import com.filelenspro.app.domain.engine.RecurrenceHelper
 import com.filelenspro.app.domain.engine.TemporalExtractor
 import com.filelenspro.app.service.ReminderScheduler
+import com.filelenspro.app.widget.FileSearchWidgetProvider
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -142,6 +145,31 @@ class SecondBrainViewModel(application: Application) : AndroidViewModel(applicat
         _pendingExtraction.value = extracted
     }
 
+    fun openManualScheduleNote(initialText: String = "") {
+        val clean = initialText.trim()
+        val extracted = if (clean.isNotBlank()) {
+            TemporalExtractor.extractTemporalAndActionItems(clean)
+        } else {
+            val defaultDt = java.time.LocalDateTime.now()
+                .plusHours(1)
+                .withMinute(0)
+                .withSecond(0)
+                .withNano(0)
+                .atZone(java.time.ZoneId.systemDefault())
+                .toOffsetDateTime()
+                .format(java.time.format.DateTimeFormatter.ISO_OFFSET_DATE_TIME)
+            TemporalExtractionResult(
+                temporalClass = "today",
+                resolvedDatetime = defaultDt,
+                actionItems = emptyList(),
+                checklistItems = emptyList(),
+                isHighConfidenceReminder = true
+            )
+        }
+        _pendingConfirmText.value = clean
+        _pendingExtraction.value = extracted
+    }
+
     fun dismissConfirmation() {
         _pendingConfirmText.value = null
         _pendingExtraction.value = null
@@ -154,7 +182,8 @@ class SecondBrainViewModel(application: Application) : AndroidViewModel(applicat
         resolvedDatetime: String?,
         checklistItems: List<ChecklistItem>,
         enableReminder: Boolean,
-        linkedDoc: FileEntity? = null
+        linkedDoc: FileEntity? = null,
+        recurrenceRule: String = RecurrenceHelper.NONE
     ) {
         viewModelScope.launch(Dispatchers.IO) {
             val nowIso = Instant.now().toString()
@@ -172,6 +201,7 @@ class SecondBrainViewModel(application: Application) : AndroidViewModel(applicat
                 customTag = "Second Brain"
             )
 
+            val normRule = RecurrenceHelper.normalize(recurrenceRule)
             val attachedImgs = _pendingAttachedImageUri.value?.let { listOf(it) } ?: emptyList()
             val note = VoiceNoteEntity(
                 fileId = indexedFile?.id ?: 0L,
@@ -186,7 +216,8 @@ class SecondBrainViewModel(application: Application) : AndroidViewModel(applicat
                 linkedDocUri = linkedDoc?.uri.orEmpty(),
                 linkedDocName = linkedDoc?.name.orEmpty(),
                 linkedDocType = linkedDoc?.extension.orEmpty(),
-                createdAt = nowIso
+                createdAt = nowIso,
+                recurrenceRule = normRule
             )
             val id = dao.insertVoiceNote(note)
 
@@ -194,15 +225,18 @@ class SecondBrainViewModel(application: Application) : AndroidViewModel(applicat
                 runCatching {
                     val triggerMillis = OffsetDateTime.parse(resolvedDatetime).toInstant().toEpochMilli()
                     ReminderScheduler.scheduleNotification(
-                        app,
-                        id.toInt(),
-                        triggerMillis,
-                        finalTitle,
-                        checklistItems.firstOrNull()?.text ?: transcript
+                        context = app,
+                        id = id.toInt(),
+                        triggerAtMillis = triggerMillis,
+                        title = finalTitle,
+                        message = checklistItems.firstOrNull()?.text ?: transcript,
+                        noteId = id,
+                        recurrenceRule = normRule
                     )
                 }
             }
 
+            FileSearchWidgetProvider.requestRefresh(app)
             _pendingConfirmText.value = null
             _pendingExtraction.value = null
             _pendingAttachedImageUri.value = null
@@ -219,16 +253,57 @@ class SecondBrainViewModel(application: Application) : AndroidViewModel(applicat
         }
     }
 
-    fun updateNoteDetails(note: VoiceNoteEntity, newTitle: String, newTemporalClass: String, newDateIso: String?, items: List<ChecklistItem>) {
+    fun updateNoteDetails(
+        note: VoiceNoteEntity,
+        newTitle: String,
+        newTemporalClass: String,
+        newDateIso: String?,
+        items: List<ChecklistItem>,
+        enableReminder: Boolean = note.isReminderSet,
+        showRescheduleToast: Boolean = false,
+        recurrenceRule: String = note.recurrenceRule
+    ) {
         viewModelScope.launch(Dispatchers.IO) {
-            dao.updateVoiceNote(
-                note.copy(
-                    title = newTitle.ifBlank { note.title },
-                    temporalClass = newTemporalClass,
-                    resolvedDatetime = newDateIso,
-                    actionItemsJson = TemporalExtractor.encodeChecklist(items)
-                )
+            val finalTitle = newTitle.ifBlank { note.title }
+            val normRule = RecurrenceHelper.normalize(recurrenceRule)
+            val updated = note.copy(
+                title = finalTitle,
+                temporalClass = newTemporalClass,
+                resolvedDatetime = newDateIso,
+                actionItemsJson = TemporalExtractor.encodeChecklist(items),
+                isReminderSet = enableReminder,
+                recurrenceRule = normRule
             )
+            dao.updateVoiceNote(updated)
+
+            ReminderScheduler.cancelNotification(app, note.id.toInt())
+            if (enableReminder && !newDateIso.isNullOrBlank()) {
+                runCatching {
+                    val triggerMillis = OffsetDateTime.parse(newDateIso).toInstant().toEpochMilli()
+                    if (triggerMillis > System.currentTimeMillis()) {
+                        ReminderScheduler.scheduleNotification(
+                            context = app,
+                            id = note.id.toInt(),
+                            triggerAtMillis = triggerMillis,
+                            title = finalTitle,
+                            message = items.firstOrNull()?.text ?: note.rawTranscript,
+                            noteId = note.id,
+                            recurrenceRule = normRule
+                        )
+                    }
+                }
+            }
+            FileSearchWidgetProvider.requestRefresh(app)
+            if (showRescheduleToast) {
+                val formatted = if (!newDateIso.isNullOrBlank()) {
+                    com.filelenspro.app.util.FormatUtils.formatDateTime(newDateIso)
+                } else {
+                    newTemporalClass
+                }
+                val repeatNote = if (RecurrenceHelper.isRecurring(normRule)) " (${RecurrenceHelper.shortLabelFor(normRule)})" else ""
+                _statusMessage.value = "Rescheduled \"$finalTitle\" to $formatted$repeatNote"
+                _activeTab.value = newTemporalClass
+            }
         }
     }
 
@@ -249,6 +324,115 @@ class SecondBrainViewModel(application: Application) : AndroidViewModel(applicat
             ReminderScheduler.cancelNotification(app, note.id.toInt())
             dao.deleteVoiceNoteById(note.id)
             if (note.fileId > 0) dao.deleteFileById(note.fileId)
+            FileSearchWidgetProvider.requestRefresh(app)
+        }
+    }
+
+    fun restoreNote(note: VoiceNoteEntity) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val id = dao.insertVoiceNote(note.copy(id = 0L))
+            if (note.isReminderSet && !note.resolvedDatetime.isNullOrBlank()) {
+                runCatching {
+                    val triggerMillis = OffsetDateTime.parse(note.resolvedDatetime).toInstant().toEpochMilli()
+                    if (triggerMillis > System.currentTimeMillis()) {
+                        ReminderScheduler.scheduleNotification(
+                            context = app,
+                            id = id.toInt(),
+                            triggerAtMillis = triggerMillis,
+                            title = note.title,
+                            message = note.rawTranscript.take(120),
+                            noteId = id,
+                            recurrenceRule = note.recurrenceRule
+                        )
+                    }
+                }
+            }
+            FileSearchWidgetProvider.requestRefresh(app)
+            _statusMessage.value = "Restored \"${note.title}\""
+        }
+    }
+
+    /**
+     * Proactive Expiry Radar: schedules 30-day, 7-day, and 1-day renewal alerts in Second Brain
+     * linked directly to the expiring document.
+     */
+    fun scheduleExpiryRenewalAlerts(item: ExpiryRadarItem, onScheduled: (Int) -> Unit = {}) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val expiryDate = runCatching { java.time.LocalDate.parse(item.expiryDateIso) }.getOrNull() ?: return@launch
+            val today = java.time.LocalDate.now()
+            val offsets = listOf(30L to "30 days left", 7L to "7 days left", 1L to "Expires tomorrow")
+            var created = 0
+            offsets.forEach { (daysBefore, label) ->
+                val alertDate = expiryDate.minusDays(daysBefore)
+                if (!alertDate.isBefore(today)) {
+                    val alertDt = alertDate.atTime(9, 0)
+                    val iso = alertDt.atZone(java.time.ZoneId.systemDefault())
+                        .toOffsetDateTime()
+                        .format(java.time.format.DateTimeFormatter.ISO_OFFSET_DATE_TIME)
+                    val tClass = if (alertDate.isEqual(today)) "today" else "future"
+                    val title = "Renew ${item.docType}: ${item.file.name.substringBeforeLast('.')} ($label)"
+                    val note = VoiceNoteEntity(
+                        uri = "expiry://${item.file.id}/${daysBefore}_${System.currentTimeMillis()}",
+                        title = title,
+                        rawTranscript = "${item.docType} expires on ${item.expiryDateIso}. ${item.matchedContext}",
+                        temporalClass = tClass,
+                        resolvedDatetime = iso,
+                        actionItemsJson = TemporalExtractor.encodeChecklist(
+                            listOf(ChecklistItem(id = "exp_${daysBefore}", text = "Renew ${item.docType} before ${item.expiryDateIso}"))
+                        ),
+                        isReminderSet = true,
+                        linkedDocUri = item.file.uri,
+                        linkedDocName = item.file.name,
+                        linkedDocType = item.file.extension,
+                        createdAt = Instant.now().toString()
+                    )
+                    val id = dao.insertVoiceNote(note)
+                    val triggerMillis = alertDt.atZone(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli()
+                    if (triggerMillis > System.currentTimeMillis()) {
+                        ReminderScheduler.scheduleNotification(
+                            context = app,
+                            id = id.toInt(),
+                            triggerAtMillis = triggerMillis,
+                            title = title,
+                            message = "Expires ${item.expiryDateIso} · Tap to view linked document",
+                            noteId = id
+                        )
+                    }
+                    created++
+                }
+            }
+            if (created == 0) {
+                // Already expired or expires today: create an immediate Today renewal task
+                val todayDt = java.time.LocalDateTime.now().plusHours(1).withSecond(0).withNano(0)
+                val iso = todayDt.atZone(java.time.ZoneId.systemDefault())
+                    .toOffsetDateTime()
+                    .format(java.time.format.DateTimeFormatter.ISO_OFFSET_DATE_TIME)
+                val title = "Urgent Renewal: ${item.docType} (${item.expiryDateIso})"
+                val note = VoiceNoteEntity(
+                    uri = "expiry://${item.file.id}/urgent_${System.currentTimeMillis()}",
+                    title = title,
+                    rawTranscript = "${item.docType} expired/expiring on ${item.expiryDateIso}.",
+                    temporalClass = "today",
+                    resolvedDatetime = iso,
+                    isReminderSet = true,
+                    linkedDocUri = item.file.uri,
+                    linkedDocName = item.file.name,
+                    linkedDocType = item.file.extension,
+                    createdAt = Instant.now().toString()
+                )
+                val id = dao.insertVoiceNote(note)
+                ReminderScheduler.scheduleNotification(
+                    context = app,
+                    id = id.toInt(),
+                    triggerAtMillis = todayDt.atZone(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli(),
+                    title = title,
+                    message = "Renew ${item.file.name}",
+                    noteId = id
+                )
+                created = 1
+            }
+            FileSearchWidgetProvider.requestRefresh(app)
+            kotlinx.coroutines.withContext(Dispatchers.Main) { onScheduled(created) }
         }
     }
 

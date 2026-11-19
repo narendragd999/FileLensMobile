@@ -4,15 +4,19 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Canvas as AndroidCanvas
 import android.graphics.Color as AndroidColor
 import android.graphics.Paint as AndroidPaint
 import android.graphics.Path as AndroidPath
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -77,13 +81,19 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.unit.IntOffset
 import com.filelenspro.app.data.db.FileEntity
 import com.filelenspro.app.data.db.VoiceNoteEntity
 import com.filelenspro.app.data.model.ChecklistItem
+import com.filelenspro.app.data.model.SavedSignatureItem
 import com.filelenspro.app.data.model.SearchFilters
+import com.filelenspro.app.data.model.SignaturePlacement
 import com.filelenspro.app.data.model.TemporalExtractionResult
+import com.filelenspro.app.domain.engine.RecurrenceHelper
 import com.filelenspro.app.domain.engine.TemporalExtractor
 import com.filelenspro.app.ui.theme.LocalFileLensColors
+import kotlin.math.roundToInt
 import java.time.LocalDate
 import java.time.LocalDateTime
 import java.time.ZoneId
@@ -220,93 +230,297 @@ fun DocumentWatermarkDialog(
 @Composable
 fun DocumentSignatureDialog(
     onDismiss: () -> Unit,
-    onApply: (Bitmap) -> Unit
+    onApply: (Bitmap) -> Unit = {},
+    savedSignatures: List<SavedSignatureItem> = emptyList(),
+    onSaveSignatureForReuse: ((Bitmap) -> Unit)? = null,
+    onDeleteSavedSignature: ((String) -> Unit)? = null,
+    onApplyWithPlacement: ((Bitmap, SignaturePlacement) -> Unit)? = null
 ) {
     val palette = LocalFileLensColors.current
     val strokes = remember { mutableStateListOf<List<Offset>>() }
     var currentStroke by remember { mutableStateOf<List<Offset>>(emptyList()) }
-    var canvasSize by remember { mutableStateOf(IntSize(600, 260)) }
+    var canvasSize by remember { mutableStateOf(IntSize(600, 240)) }
+    var selectedSavedPath by remember { mutableStateOf<String?>(null) }
+    var saveForReuse by remember { mutableStateOf(true) }
+    var includeDateStamp by remember { mutableStateOf(true) }
+    var posX by remember { mutableFloatStateOf(0.58f) }
+    var posY by remember { mutableFloatStateOf(0.76f) }
+    var widthFraction by remember { mutableFloatStateOf(0.32f) }
+    var previewBoxSize by remember { mutableStateOf(IntSize(400, 220)) }
+
+    val selectedSavedBmp = remember(selectedSavedPath) {
+        selectedSavedPath?.let { runCatching { BitmapFactory.decodeFile(it) }.getOrNull() }
+    }
+    val hasSignature = selectedSavedBmp != null || strokes.isNotEmpty()
 
     AlertDialog(
         onDismissRequest = onDismiss,
         containerColor = palette.surface,
-        title = { Text("Draw E-Signature", color = palette.text) },
+        title = { Text("E-Signature & Placement", color = palette.text, fontWeight = FontWeight.Bold) },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text("Sign inside the box below to stamp onto document", style = MaterialTheme.typography.bodyMedium, color = palette.muted)
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                if (savedSignatures.isNotEmpty()) {
+                    Text(
+                        "Saved Signatures (1-tap reuse)",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = palette.muted
+                    )
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        savedSignatures.forEach { item ->
+                            val isSel = selectedSavedPath == item.filePath
+                            val thumb = remember(item.filePath) {
+                                runCatching { BitmapFactory.decodeFile(item.filePath) }.getOrNull()
+                            }
+                            if (thumb != null) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(width = 110.dp, height = 56.dp)
+                                        .clip(RoundedCornerShape(10.dp))
+                                        .background(Color.White)
+                                        .border(
+                                            width = if (isSel) 2.5.dp else 1.dp,
+                                            color = if (isSel) palette.accent else palette.border,
+                                            shape = RoundedCornerShape(10.dp)
+                                        )
+                                        .clickable {
+                                            selectedSavedPath = if (isSel) null else item.filePath
+                                        }
+                                        .padding(4.dp)
+                                ) {
+                                    Image(
+                                        bitmap = thumb.asImageBitmap(),
+                                        contentDescription = item.name,
+                                        modifier = Modifier.matchParentSize()
+                                    )
+                                    if (onDeleteSavedSignature != null) {
+                                        Box(
+                                            modifier = Modifier
+                                                .align(Alignment.TopEnd)
+                                                .size(20.dp)
+                                                .clip(RoundedCornerShape(6.dp))
+                                                .background(palette.danger.copy(alpha = 0.85f))
+                                                .clickable {
+                                                    if (selectedSavedPath == item.filePath) selectedSavedPath = null
+                                                    onDeleteSavedSignature(item.filePath)
+                                                },
+                                            contentAlignment = Alignment.Center
+                                        ) {
+                                            Icon(
+                                                Icons.Rounded.DeleteOutline,
+                                                contentDescription = "Delete saved signature",
+                                                tint = Color.White,
+                                                modifier = Modifier.size(13.dp)
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Text(
+                    if (selectedSavedBmp != null) "Using saved signature · tap it again to draw a new one"
+                    else "Draw signature below",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = palette.muted
+                )
+                if (selectedSavedBmp == null) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(145.dp)
+                            .clip(RoundedCornerShape(14.dp))
+                            .background(Color.White)
+                            .border(1.5.dp, palette.border, RoundedCornerShape(14.dp))
+                            .onSizeChanged { canvasSize = it }
+                            .pointerInput(Unit) {
+                                detectDragGestures(
+                                    onDragStart = { offset -> currentStroke = listOf(offset) },
+                                    onDrag = { change, _ ->
+                                        change.consume()
+                                        currentStroke = currentStroke + change.position
+                                    },
+                                    onDragEnd = {
+                                        if (currentStroke.size > 1) strokes.add(currentStroke)
+                                        currentStroke = emptyList()
+                                    }
+                                )
+                            }
+                            .testTag("signature_draw_pad")
+                    ) {
+                        Canvas(modifier = Modifier.matchParentSize()) {
+                            val allStrokes = strokes + listOf(currentStroke)
+                            allStrokes.forEach { pts ->
+                                if (pts.size > 1) {
+                                    val path = Path().apply {
+                                        moveTo(pts.first().x, pts.first().y)
+                                        pts.drop(1).forEach { lineTo(it.x, it.y) }
+                                    }
+                                    drawPath(
+                                        path = path,
+                                        color = Color(0xFF0F172A),
+                                        style = Stroke(width = 7f, cap = StrokeCap.Round, join = StrokeJoin.Round)
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Interactive Drag-to-Place Page Preview
+                Text(
+                    "Drag badge on page preview to position signature",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = palette.muted
+                )
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(180.dp)
-                        .clip(RoundedCornerShape(14.dp))
-                        .background(Color.White)
-                        .border(1.5.dp, palette.border, RoundedCornerShape(14.dp))
-                        .onSizeChanged { canvasSize = it }
-                        .pointerInput(Unit) {
-                            detectDragGestures(
-                                onDragStart = { offset -> currentStroke = listOf(offset) },
-                                onDrag = { change, _ ->
-                                    change.consume()
-                                    currentStroke = currentStroke + change.position
-                                },
-                                onDragEnd = {
-                                    if (currentStroke.size > 1) strokes.add(currentStroke)
-                                    currentStroke = emptyList()
-                                }
-                            )
-                        }
-                ) {
-                    Canvas(modifier = Modifier.matchParentSize()) {
-                        val allStrokes = strokes + listOf(currentStroke)
-                        allStrokes.forEach { pts ->
-                            if (pts.size > 1) {
-                                val path = Path().apply {
-                                    moveTo(pts.first().x, pts.first().y)
-                                    pts.drop(1).forEach { lineTo(it.x, it.y) }
-                                }
-                                drawPath(
-                                    path = path,
-                                    color = Color(0xFF0F172A),
-                                    style = Stroke(width = 7f, cap = StrokeCap.Round, join = StrokeJoin.Round)
-                                )
+                        .height(140.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(Color(0xFFF8FAFC))
+                        .border(1.dp, palette.border, RoundedCornerShape(12.dp))
+                        .onSizeChanged { previewBoxSize = it }
+                        .pointerInput(widthFraction) {
+                            detectDragGestures { change, dragAmount ->
+                                change.consume()
+                                val w = previewBoxSize.width.coerceAtLeast(1).toFloat()
+                                val h = previewBoxSize.height.coerceAtLeast(1).toFloat()
+                                posX = (posX + dragAmount.x / w).coerceIn(0.02f, (1f - widthFraction).coerceAtLeast(0.05f))
+                                posY = (posY + dragAmount.y / h).coerceIn(0.04f, 0.84f)
                             }
                         }
+                        .testTag("signature_placement_preview")
+                ) {
+                    // Subtle faux document lines
+                    Column(
+                        modifier = Modifier.padding(14.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        repeat(5) { idx ->
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth(if (idx == 4) 0.55f else 0.92f)
+                                    .height(6.dp)
+                                    .clip(RoundedCornerShape(3.dp))
+                                    .background(Color(0xFFE2E8F0))
+                            )
+                        }
+                    }
+                    val badgeW = (previewBoxSize.width * widthFraction).roundToInt().coerceAtLeast(64)
+                    val offsetX = (previewBoxSize.width * posX).roundToInt().coerceIn(0, (previewBoxSize.width - badgeW).coerceAtLeast(0))
+                    val offsetY = (previewBoxSize.height * posY).roundToInt().coerceIn(0, (previewBoxSize.height - 34).coerceAtLeast(0))
+                    Surface(
+                        color = palette.accent.copy(alpha = 0.22f),
+                        shape = RoundedCornerShape(8.dp),
+                        modifier = Modifier
+                            .offset { IntOffset(offsetX, offsetY) }
+                            .border(1.5.dp, palette.accent, RoundedCornerShape(8.dp))
+                    ) {
+                        Text(
+                            text = if (includeDateStamp) "SIGN + DATE" else "SIGNATURE",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = palette.accent,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp)
+                        )
+                    }
+                }
+
+                // Size slider
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text("Size: ${(widthFraction * 100).toInt()}%", style = MaterialTheme.typography.labelMedium, color = palette.muted)
+                    Slider(
+                        value = widthFraction,
+                        onValueChange = { widthFraction = it },
+                        valueRange = 0.18f..0.60f,
+                        modifier = Modifier.weight(1f).padding(start = 10.dp)
+                    )
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text("Stamp today's date below", style = MaterialTheme.typography.bodySmall, color = palette.text)
+                    Switch(checked = includeDateStamp, onCheckedChange = { includeDateStamp = it })
+                }
+
+                if (selectedSavedBmp == null && onSaveSignatureForReuse != null) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text("Save signature for 1-tap reuse", style = MaterialTheme.typography.bodySmall, color = palette.text)
+                        Switch(checked = saveForReuse, onCheckedChange = { saveForReuse = it })
                     }
                 }
             }
         },
         confirmButton = {
             Button(
-                enabled = strokes.isNotEmpty(),
+                enabled = hasSignature,
                 onClick = {
-                    val w = canvasSize.width.coerceAtLeast(400)
-                    val h = canvasSize.height.coerceAtLeast(200)
-                    val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-                    val c = AndroidCanvas(bmp)
-                    val p = AndroidPaint().apply {
-                        color = AndroidColor.rgb(15, 23, 42)
-                        strokeWidth = 8f
-                        style = AndroidPaint.Style.STROKE
-                        strokeCap = AndroidPaint.Cap.ROUND
-                        strokeJoin = AndroidPaint.Join.ROUND
-                        isAntiAlias = true
-                    }
-                    strokes.forEach { pts ->
-                        if (pts.size > 1) {
-                            val ap = AndroidPath().apply {
-                                moveTo(pts.first().x, pts.first().y)
-                                pts.drop(1).forEach { lineTo(it.x, it.y) }
+                    val bmp = selectedSavedBmp ?: run {
+                        val w = canvasSize.width.coerceAtLeast(400)
+                        val h = canvasSize.height.coerceAtLeast(200)
+                        Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).also { out ->
+                            val c = AndroidCanvas(out)
+                            val p = AndroidPaint().apply {
+                                color = AndroidColor.rgb(15, 23, 42)
+                                strokeWidth = 8f
+                                style = AndroidPaint.Style.STROKE
+                                strokeCap = AndroidPaint.Cap.ROUND
+                                strokeJoin = AndroidPaint.Join.ROUND
+                                isAntiAlias = true
                             }
-                            c.drawPath(ap, p)
+                            strokes.forEach { pts ->
+                                if (pts.size > 1) {
+                                    val ap = AndroidPath().apply {
+                                        moveTo(pts.first().x, pts.first().y)
+                                        pts.drop(1).forEach { lineTo(it.x, it.y) }
+                                    }
+                                    c.drawPath(ap, p)
+                                }
+                            }
+                            if (saveForReuse) onSaveSignatureForReuse?.invoke(out)
                         }
                     }
-                    onApply(bmp)
-                }
+                    val placement = SignaturePlacement(
+                        posX = posX,
+                        posY = posY,
+                        widthFraction = widthFraction,
+                        includeDateStamp = includeDateStamp
+                    )
+                    if (onApplyWithPlacement != null) {
+                        onApplyWithPlacement(bmp, placement)
+                    } else {
+                        onApply(bmp)
+                    }
+                },
+                modifier = Modifier.testTag("stamp_signature_confirm_btn")
             ) { Text("Stamp Signature") }
         },
         dismissButton = {
             Row {
-                TextButton(onClick = { strokes.clear() }) { Text("Clear") }
+                if (selectedSavedBmp == null) {
+                    TextButton(onClick = { strokes.clear() }) { Text("Clear") }
+                }
                 TextButton(onClick = onDismiss) { Text("Cancel") }
             }
         }
@@ -413,14 +627,26 @@ fun VoiceNoteConfirmDialog(
         resolvedDatetime: String?,
         items: List<ChecklistItem>,
         enableReminder: Boolean,
-        linkedDoc: FileEntity?
+        linkedDoc: FileEntity?,
+        recurrenceRule: String
     ) -> Unit
 ) {
     val palette = LocalFileLensColors.current
+    val initialDt = remember(rawText, extraction.resolvedDatetime) {
+        ScheduleDateTimeHelper.parseInitialLocalDateTime(extraction.resolvedDatetime)
+    }
     var title by remember(rawText) { mutableStateOf(extraction.actionItems.firstOrNull()?.take(48) ?: rawText.take(48)) }
     var transcript by remember(rawText) { mutableStateOf(rawText) }
-    var temporalClass by remember(rawText) { mutableStateOf(extraction.temporalClass) }
-    var resolvedDt by remember(rawText) { mutableStateOf(extraction.resolvedDatetime) }
+    var selectedDate by remember(rawText) { mutableStateOf(initialDt.toLocalDate()) }
+    var selectedTime by remember(rawText) { mutableStateOf(initialDt.toLocalTime()) }
+    var recurrenceRule by remember(rawText) { mutableStateOf(RecurrenceHelper.NONE) }
+    var temporalClass by remember(rawText) {
+        mutableStateOf(
+            if (extraction.resolvedDatetime != null) {
+                ScheduleDateTimeHelper.classifyTemporalFromDate(initialDt.toLocalDate())
+            } else extraction.temporalClass
+        )
+    }
     var enableReminder by remember(rawText) { mutableStateOf(extraction.isHighConfidenceReminder) }
     var checklist by remember(rawText) { mutableStateOf(extraction.checklistItems) }
     var newActionText by remember { mutableStateOf("") }
@@ -430,7 +656,7 @@ fun VoiceNoteConfirmDialog(
     AlertDialog(
         onDismissRequest = onDismiss,
         containerColor = palette.surface,
-        title = { Text("Confirm Second Brain Note", color = palette.text) },
+        title = { Text(if (rawText.isBlank()) "Schedule Second Brain Task" else "Confirm Second Brain Note", color = palette.text) },
         text = {
             Column(
                 modifier = Modifier.verticalScroll(rememberScrollState()),
@@ -439,34 +665,38 @@ fun VoiceNoteConfirmDialog(
                 OutlinedTextField(
                     value = title,
                     onValueChange = { title = it },
-                    label = { Text("Title") },
+                    label = { Text("Task / Note Title") },
+                    placeholder = { Text("e.g. Pay Insurance / Doctor Visit") },
                     singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
+                    modifier = Modifier.fillMaxWidth().testTag("confirm_note_title_input")
                 )
                 OutlinedTextField(
                     value = transcript,
                     onValueChange = { transcript = it },
-                    label = { Text("Transcript / Note") },
+                    label = { Text("Details / Transcript") },
                     maxLines = 4,
                     modifier = Modifier.fillMaxWidth()
                 )
-                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    listOf("today" to "Today", "future" to "Upcoming", "historical" to "History").forEach { (key, label) ->
-                        FilterChip(
-                            selected = temporalClass == key,
-                            onClick = {
-                                temporalClass = key
-                                val d = when (key) {
-                                    "future" -> LocalDate.now().plusDays(1)
-                                    else -> LocalDate.now()
-                                }
-                                resolvedDt = d.atTime(9, 0).atZone(ZoneId.systemDefault()).toOffsetDateTime()
-                                    .format(DateTimeFormatter.ISO_OFFSET_DATE_TIME)
-                            },
-                            label = { Text(label) }
-                        )
+
+                // Manual Calendar Date + Clock Time Picker + Quick Presets + Repeat Recurrence
+                ScheduleDateTimeSection(
+                    selectedDate = selectedDate,
+                    selectedTime = selectedTime,
+                    onDateTimeChanged = { newDate, newTime ->
+                        selectedDate = newDate
+                        selectedTime = newTime
+                        temporalClass = ScheduleDateTimeHelper.classifyTemporalFromDate(newDate)
+                        if (temporalClass != "historical") {
+                            enableReminder = true
+                        }
+                    },
+                    recurrenceRule = recurrenceRule,
+                    onRecurrenceChanged = { nextRule ->
+                        recurrenceRule = nextRule
+                        if (RecurrenceHelper.isRecurring(nextRule)) enableReminder = true
                     }
-                }
+                )
+
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
@@ -475,7 +705,7 @@ fun VoiceNoteConfirmDialog(
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Icon(Icons.Rounded.NotificationsActive, contentDescription = null, tint = palette.accent, modifier = Modifier.size(18.dp))
                         Spacer(Modifier.width(6.dp))
-                        Text("Schedule Reminder", style = MaterialTheme.typography.bodyMedium, color = palette.text)
+                        Text("Schedule Reminder Alert", style = MaterialTheme.typography.bodyMedium, color = palette.text)
                     }
                     Switch(checked = enableReminder, onCheckedChange = { enableReminder = it })
                 }
@@ -532,9 +762,14 @@ fun VoiceNoteConfirmDialog(
         },
         confirmButton = {
             Button(
-                onClick = { onSave(title, transcript, temporalClass, resolvedDt, checklist, enableReminder, selectedDoc) },
+                enabled = title.isNotBlank() || transcript.isNotBlank(),
+                onClick = {
+                    val resolvedIso = ScheduleDateTimeHelper.toIsoOffsetString(selectedDate, selectedTime)
+                    val safeTranscript = transcript.ifBlank { title }
+                    onSave(title, safeTranscript, temporalClass, resolvedIso, checklist, enableReminder, selectedDoc, recurrenceRule)
+                },
                 modifier = Modifier.testTag("confirm_brain_note_btn")
-            ) { Text("Save Note") }
+            ) { Text("Schedule & Save") }
         },
         dismissButton = {
             TextButton(onClick = onDismiss) { Text("Discard") }
@@ -546,48 +781,101 @@ fun VoiceNoteConfirmDialog(
 fun RescheduleNoteDialog(
     note: VoiceNoteEntity,
     onDismiss: () -> Unit,
-    onSave: (title: String, temporalClass: String, resolvedDatetime: String?, items: List<ChecklistItem>) -> Unit
+    onSave: (
+        title: String,
+        temporalClass: String,
+        resolvedDatetime: String?,
+        items: List<ChecklistItem>,
+        enableReminder: Boolean,
+        recurrenceRule: String
+    ) -> Unit
 ) {
     val palette = LocalFileLensColors.current
-    var title by remember { mutableStateOf(note.title) }
-    var temporalClass by remember { mutableStateOf(note.temporalClass) }
-    var resolvedDt by remember { mutableStateOf(note.resolvedDatetime) }
-    val items = remember { TemporalExtractor.parseChecklist(note.actionItemsJson) }
+    val initialDt = remember(note.id, note.resolvedDatetime) {
+        ScheduleDateTimeHelper.parseInitialLocalDateTime(note.resolvedDatetime)
+    }
+    var title by remember(note.id) { mutableStateOf(note.title) }
+    var selectedDate by remember(note.id) { mutableStateOf(initialDt.toLocalDate()) }
+    var selectedTime by remember(note.id) { mutableStateOf(initialDt.toLocalTime()) }
+    var temporalClass by remember(note.id) { mutableStateOf(note.temporalClass) }
+    var enableReminder by remember(note.id) { mutableStateOf(note.isReminderSet) }
+    var recurrenceRule by remember(note.id) { mutableStateOf(RecurrenceHelper.normalize(note.recurrenceRule)) }
+    val items = remember(note.id) { TemporalExtractor.parseChecklist(note.actionItemsJson) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
         containerColor = palette.surface,
-        title = { Text("Edit / Reschedule Note", color = palette.text) },
+        title = { Text("Reschedule Task", color = palette.text, fontWeight = FontWeight.Bold) },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
                 OutlinedTextField(
                     value = title,
                     onValueChange = { title = it },
-                    label = { Text("Title") },
-                    modifier = Modifier.fillMaxWidth()
+                    label = { Text("Task Title") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth().testTag("reschedule_title_input")
                 )
-                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    listOf(
-                        "Today 9 AM" to ("today" to LocalDate.now().atTime(9, 0)),
-                        "Tomorrow 9 AM" to ("future" to LocalDate.now().plusDays(1).atTime(9, 0)),
-                        "Next Week" to ("future" to LocalDate.now().plusDays(7).atTime(9, 0)),
-                        "History" to ("historical" to LocalDateTime.now())
-                    ).forEach { (label, target) ->
-                        FilterChip(
-                            selected = temporalClass == target.first,
-                            onClick = {
-                                temporalClass = target.first
-                                resolvedDt = target.second.atZone(ZoneId.systemDefault()).toOffsetDateTime()
-                                    .format(DateTimeFormatter.ISO_OFFSET_DATE_TIME)
-                            },
-                            label = { Text(label) }
-                        )
+
+                ScheduleDateTimeSection(
+                    selectedDate = selectedDate,
+                    selectedTime = selectedTime,
+                    onDateTimeChanged = { newDate, newTime ->
+                        selectedDate = newDate
+                        selectedTime = newTime
+                        temporalClass = ScheduleDateTimeHelper.classifyTemporalFromDate(newDate)
+                        if (temporalClass != "historical") {
+                            enableReminder = true
+                        }
+                    },
+                    recurrenceRule = recurrenceRule,
+                    onRecurrenceChanged = { nextRule ->
+                        recurrenceRule = nextRule
+                        if (RecurrenceHelper.isRecurring(nextRule)) enableReminder = true
                     }
+                )
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Rounded.NotificationsActive, contentDescription = null, tint = palette.accent, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("Reminder Alert", style = MaterialTheme.typography.bodyMedium, color = palette.text)
+                    }
+                    Switch(
+                        checked = enableReminder,
+                        onCheckedChange = { enableReminder = it },
+                        modifier = Modifier.testTag("reschedule_reminder_switch")
+                    )
+                }
+
+                // Quick option to archive/move to History
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    FilterChip(
+                        selected = temporalClass == "historical",
+                        onClick = {
+                            temporalClass = "historical"
+                            enableReminder = false
+                            recurrenceRule = RecurrenceHelper.NONE
+                        },
+                        label = { Text("Move to History") }
+                    )
                 }
             }
         },
         confirmButton = {
-            Button(onClick = { onSave(title, temporalClass, resolvedDt, items) }) { Text("Update") }
+            Button(
+                onClick = {
+                    val resolvedIso = ScheduleDateTimeHelper.toIsoOffsetString(selectedDate, selectedTime)
+                    onSave(title, temporalClass, resolvedIso, items, enableReminder, recurrenceRule)
+                },
+                modifier = Modifier.testTag("reschedule_save_btn")
+            ) { Text("Update Schedule") }
         },
         dismissButton = {
             TextButton(onClick = onDismiss) { Text("Cancel") }

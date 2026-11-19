@@ -8,9 +8,15 @@ import android.os.Environment
 import android.os.StatFs
 import android.webkit.MimeTypeMap
 import com.filelenspro.app.data.db.FileEntity
+import com.filelenspro.app.data.model.CleanerCategory
+import com.filelenspro.app.data.model.CleanerFileItem
 import com.filelenspro.app.data.model.DuplicateFileItem
 import com.filelenspro.app.data.model.DuplicateGroup
 import com.filelenspro.app.data.model.JunkCacheStats
+import com.filelenspro.app.data.model.PdfCompressCandidate
+import com.filelenspro.app.data.model.PdfCompressPreset
+import com.filelenspro.app.data.model.PhotoCompressCandidate
+import com.filelenspro.app.data.model.PhotoCompressPreset
 import com.filelenspro.app.data.model.SimilarImageItem
 import com.filelenspro.app.data.model.StorageAnalysis
 import com.filelenspro.app.data.model.StorageCategoryStat
@@ -27,24 +33,52 @@ class StorageAnalyzer(
     private val engine: OcrAndPdfEngine
 ) {
     fun getAppRootFolders(): List<StorageItem> {
-        val dirs = listOf(
+        val result = mutableListOf<StorageItem>()
+        if (com.filelenspro.app.util.StoragePermissionHelper.hasAllFilesAccess(context)) {
+            val deviceRoots = listOf(
+                "Internal Storage (Device)" to Environment.getExternalStorageDirectory(),
+                "Downloads" to Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+                "Documents" to Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS),
+                "DCIM / Camera" to Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM)
+            )
+            deviceRoots.forEach { (label, dir) ->
+                if (dir != null && dir.exists() && dir.canRead()) {
+                    result.add(
+                        StorageItem(
+                            id = "device_${dir.absolutePath}",
+                            name = label,
+                            path = dir.absolutePath,
+                            isDirectory = true,
+                            size = 0L,
+                            modifiedMs = dir.lastModified(),
+                            extension = "",
+                            mimeType = "inode/directory"
+                        )
+                    )
+                }
+            }
+        }
+        val vaultDirs = listOf(
             "ScannedDocs" to File(context.filesDir, "ScannedDocs").apply { mkdirs() },
             "IndexedDocs" to File(context.filesDir, "IndexedDocs").apply { mkdirs() },
             "SmartCards" to File(context.filesDir, "SmartCards").apply { mkdirs() },
             "Exports" to File(context.filesDir, "Exports").apply { mkdirs() }
         )
-        return dirs.map { (label, dir) ->
-            StorageItem(
-                id = dir.absolutePath,
-                name = label,
-                path = dir.absolutePath,
-                isDirectory = true,
-                size = dir.walkTopDown().filter { it.isFile }.sumOf { it.length() },
-                modifiedMs = dir.lastModified(),
-                extension = "",
-                mimeType = "inode/directory"
+        vaultDirs.forEach { (label, dir) ->
+            result.add(
+                StorageItem(
+                    id = dir.absolutePath,
+                    name = label,
+                    path = dir.absolutePath,
+                    isDirectory = true,
+                    size = dir.walkTopDown().filter { it.isFile }.sumOf { it.length() },
+                    modifiedMs = dir.lastModified(),
+                    extension = "",
+                    mimeType = "inode/directory"
+                )
             )
         }
+        return result
     }
 
     fun listDirectory(dirPath: String): List<StorageItem> {
@@ -207,6 +241,160 @@ class StorageAnalyzer(
             }
             clusters
         }
+
+    suspend fun findCompressiblePhotos(
+        files: List<FileEntity>,
+        preset: PhotoCompressPreset = PhotoCompressPreset.LOSSLESS_LOOK,
+        minSizeBytes: Long = 150_000L
+    ): List<PhotoCompressCandidate> = withContext(Dispatchers.IO) {
+        val imageExts = setOf("jpg", "jpeg", "png", "webp")
+        files.filter { f ->
+            f.extension.lowercase(Locale.ROOT) in imageExts && f.size >= minSizeBytes
+        }
+            .sortedByDescending { it.size }
+            .take(120)
+            .map { f ->
+                val (w, h) = engine.readImageDimensions(f.uri)
+                val estSaved = (f.size * (1f - preset.estimatedRatio)).toLong().coerceAtLeast(0L)
+                PhotoCompressCandidate(
+                    id = f.id,
+                    uri = f.uri,
+                    name = f.name,
+                    sizeBytes = f.size,
+                    width = w,
+                    height = h,
+                    modified = f.modified,
+                    selected = f.size >= 400_000L,
+                    estimatedSavedBytes = estSaved
+                )
+            }
+    }
+
+    suspend fun findCompressiblePdfs(
+        files: List<FileEntity>,
+        preset: PdfCompressPreset = PdfCompressPreset.BALANCED,
+        minSizeBytes: Long = 200_000L
+    ): List<PdfCompressCandidate> = withContext(Dispatchers.IO) {
+        files.filter { f ->
+            f.extension.equals("pdf", true) && f.size >= minSizeBytes
+        }
+            .sortedByDescending { it.size }
+            .take(80)
+            .map { f ->
+                val estSaved = (f.size * (1f - preset.estimatedRatio)).toLong().coerceAtLeast(0L)
+                PdfCompressCandidate(
+                    id = f.id,
+                    uri = f.uri,
+                    name = f.name,
+                    sizeBytes = f.size,
+                    pageCount = f.pageCount.coerceAtLeast(1),
+                    modified = f.modified,
+                    selected = f.size >= 800_000L,
+                    estimatedSavedBytes = estSaved
+                )
+            }
+    }
+
+    suspend fun findOldDownloads(daysThreshold: Int = 90): List<CleanerFileItem> = withContext(Dispatchers.IO) {
+        val cutoffMs = System.currentTimeMillis() - daysThreshold * 86_400_000L
+        val results = mutableListOf<CleanerFileItem>()
+        val roots = buildList {
+            if (com.filelenspro.app.util.StoragePermissionHelper.hasAllFilesAccess(context)) {
+                Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)?.let { add(it) }
+            }
+            add(File(context.filesDir, "Exports"))
+        }
+        roots.forEach { dir ->
+            if (dir.exists() && dir.canRead()) {
+                dir.walkTopDown().maxDepth(4)
+                    .filter { it.isFile && !it.name.startsWith(".") && it.lastModified() in 1L..cutoffMs && it.length() >= 50_000L }
+                    .take(60)
+                    .forEach { f ->
+                        results.add(
+                            CleanerFileItem(
+                                path = f.absolutePath,
+                                uri = f.toURI().toString(),
+                                name = f.name,
+                                sizeBytes = f.length(),
+                                modifiedMs = f.lastModified(),
+                                category = CleanerCategory.OLD_DOWNLOADS
+                            )
+                        )
+                    }
+            }
+        }
+        results.sortedByDescending { it.sizeBytes }.take(60)
+    }
+
+    suspend fun findLeftoverApks(): List<CleanerFileItem> = withContext(Dispatchers.IO) {
+        val results = mutableListOf<CleanerFileItem>()
+        if (!com.filelenspro.app.util.StoragePermissionHelper.hasAllFilesAccess(context)) return@withContext results
+        val roots = listOfNotNull(
+            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+            Environment.getExternalStorageDirectory()
+        )
+        val seen = mutableSetOf<String>()
+        roots.forEach { dir ->
+            if (dir.exists() && dir.canRead()) {
+                dir.walkTopDown().maxDepth(4)
+                    .onEnter { d -> !d.name.startsWith(".") && d.name != "Android" }
+                    .filter { it.isFile && it.extension.equals("apk", true) && seen.add(it.absolutePath) }
+                    .take(60)
+                    .forEach { f ->
+                        results.add(
+                            CleanerFileItem(
+                                path = f.absolutePath,
+                                uri = f.toURI().toString(),
+                                name = f.name,
+                                sizeBytes = f.length(),
+                                modifiedMs = f.lastModified(),
+                                category = CleanerCategory.LEFTOVER_APKS,
+                                selected = true
+                            )
+                        )
+                    }
+            }
+        }
+        results.sortedByDescending { it.sizeBytes }.take(60)
+    }
+
+    suspend fun findLargeVideos(minSizeBytes: Long = 20_000_000L): List<CleanerFileItem> = withContext(Dispatchers.IO) {
+        val results = mutableListOf<CleanerFileItem>()
+        if (!com.filelenspro.app.util.StoragePermissionHelper.hasAllFilesAccess(context)) return@withContext results
+        val videoExts = setOf("mp4", "mkv", "mov", "avi", "webm", "3gp")
+        val roots = listOfNotNull(
+            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES),
+            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM),
+            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+        )
+        val seen = mutableSetOf<String>()
+        roots.forEach { dir ->
+            if (dir.exists() && dir.canRead()) {
+                dir.walkTopDown().maxDepth(4)
+                    .onEnter { d -> !d.name.startsWith(".") && d.name != "Android" }
+                    .filter {
+                        it.isFile &&
+                            it.extension.lowercase(Locale.ROOT) in videoExts &&
+                            it.length() >= minSizeBytes &&
+                            seen.add(it.absolutePath)
+                    }
+                    .take(50)
+                    .forEach { f ->
+                        results.add(
+                            CleanerFileItem(
+                                path = f.absolutePath,
+                                uri = f.toURI().toString(),
+                                name = f.name,
+                                sizeBytes = f.length(),
+                                modifiedMs = f.lastModified(),
+                                category = CleanerCategory.LARGE_VIDEOS
+                            )
+                        )
+                    }
+            }
+        }
+        results.sortedByDescending { it.sizeBytes }.take(50)
+    }
 
     fun deleteLocalUri(uriString: String): Boolean {
         return try {
