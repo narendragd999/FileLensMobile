@@ -245,6 +245,104 @@ class DocumentEdgeDetectorTest {
     }
 
     @Test
+    fun lumaFingerprint_ignoresExposureFlickerAndDetectsPageSwap() {
+        val w = 96
+        val h = 128
+        // Page 1: bright paper with dark header band at top
+        val page1 = ByteArray(w * h) { idx ->
+            val y = idx / w
+            if (y in 25..42) 45.toByte() else 225.toByte()
+        }
+        // Same page 1 with slight camera auto-exposure brightness shift (+8)
+        val page1Flicker = ByteArray(w * h) { idx ->
+            val base = page1[idx].toInt() and 0xFF
+            (base + 8).coerceIn(0, 255).toByte()
+        }
+        // Page 2: different printed layout (dark content block in lower half)
+        val page2 = ByteArray(w * h) { idx ->
+            val y = idx / w
+            if (y in 70..105) 45.toByte() else 225.toByte()
+        }
+        // Empty dark desk while swapping sheets
+        val emptyDesk = ByteArray(w * h) { 35.toByte() }
+
+        val fp1 = DocumentEdgeDetector.computeLumaFingerprint(page1, w, h)
+        val fp1Flicker = DocumentEdgeDetector.computeLumaFingerprint(page1Flicker, w, h)
+        val fp2 = DocumentEdgeDetector.computeLumaFingerprint(page2, w, h)
+        val fpDesk = DocumentEdgeDetector.computeLumaFingerprint(emptyDesk, w, h)
+
+        val flickerDiff = DocumentEdgeDetector.fingerprintDifference(fp1, fp1Flicker)
+        val swapDiff = DocumentEdgeDetector.fingerprintDifference(fp1, fp2)
+        val deskDiff = DocumentEdgeDetector.fingerprintDifference(fp1, fpDesk)
+
+        assertTrue("Exposure flicker should stay below threshold (<0.05), got $flickerDiff", flickerDiff < 0.05f)
+        assertTrue("Swapping to a different page should exceed threshold (>=0.11), got $swapDiff", swapDiff >= 0.11f)
+        assertTrue("Removing sheet onto dark desk should exceed threshold (>=0.11), got $deskDiff", deskDiff >= 0.11f)
+    }
+
+    @Test
+    fun detectFromLumaGrid_recoversTrueCornersThroughDarkHeaderAndFingerNotch() {
+        val w = 120
+        val h = 100
+        val grid = ByteArray(w * h) { 28.toByte() } // dark desk
+
+        // Bright paper sheet in [20..100, 14..86]
+        for (y in 14..86) {
+            for (x in 20..100) {
+                grid[y * w + x] = 236.toByte()
+            }
+        }
+        // Dark printed letterhead banner inside top of sheet [24..96, 20..30]
+        for (y in 20..30) {
+            for (x in 24..96) {
+                grid[y * w + x] = 42.toByte()
+            }
+        }
+        // Finger notch occluding middle of left edge [18..28, 45..58]
+        for (y in 45..58) {
+            for (x in 18..28) {
+                grid[y * w + x] = 70.toByte()
+            }
+        }
+
+        val quad = DocumentEdgeDetector.detectFromLumaGrid(grid, w, h)
+        assertNotNull("Expected Hough 4-line + CC hybrid to find sheet despite header & finger notch", quad)
+        quad!!
+        assertEquals(20f / w, quad.tlX, 0.05f)
+        assertEquals(14f / h, quad.tlY, 0.05f)
+        assertEquals(100f / w, quad.brX, 0.05f)
+        assertEquals(86f / h, quad.brY, 0.05f)
+        assertTrue(DocumentEdgeDetector.isConvexAndValid(quad))
+    }
+
+    @Test
+    fun slideEdgeAlongPerspective_movesTopEdgeAlongConvergingSideRays() {
+        // Symmetric trapezoid: narrower at top [0.30..0.70] at y=0.20, wider at bottom [0.10..0.90] at y=0.80
+        // Left ray slope: x = 0.30 - (0.20 / 0.60) * (y - 0.20)
+        // Right ray slope: x = 0.70 + (0.20 / 0.60) * (y - 0.20)
+        val trapezoid = NormalizedQuad(
+            tlX = 0.30f, tlY = 0.20f,
+            trX = 0.70f, trY = 0.20f,
+            brX = 0.90f, brY = 0.80f,
+            blX = 0.10f, blY = 0.80f
+        )
+
+        // Slide top edge (edgeIndex = 0) downward by dy = +0.15
+        val slid = DocumentEdgeDetector.slideEdgeAlongPerspective(trapezoid, edgeIndex = 0, dx = 0f, dy = 0.15f)
+        // Top edge should move down to y=0.35 and expand outward along the perspective rays to [0.25..0.75]
+        assertEquals(0.35f, slid.tlY, 0.02f)
+        assertEquals(0.35f, slid.trY, 0.02f)
+        assertTrue("Top-left should move outward left along perspective ray (expected ~0.25, got ${slid.tlX})", slid.tlX < 0.28f)
+        assertTrue("Top-right should move outward right along perspective ray (expected ~0.75, got ${slid.trX})", slid.trX > 0.72f)
+        // Bottom corners must stay anchored
+        assertEquals(0.10f, slid.blX, 0.001f)
+        assertEquals(0.80f, slid.blY, 0.001f)
+        assertEquals(0.90f, slid.brX, 0.001f)
+        assertEquals(0.80f, slid.brY, 0.001f)
+        assertTrue(DocumentEdgeDetector.isConvexForWarp(slid))
+    }
+
+    @Test
     fun photoCompressPresets_areOrderedByQualityAndSavings() {
         assertTrue(PhotoCompressPreset.MAX_QUALITY.quality > PhotoCompressPreset.LOSSLESS_LOOK.quality)
         assertTrue(PhotoCompressPreset.LOSSLESS_LOOK.quality > PhotoCompressPreset.ULTRA_COMPACT.quality)

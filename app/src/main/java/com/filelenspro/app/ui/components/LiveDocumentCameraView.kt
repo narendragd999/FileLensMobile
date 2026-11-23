@@ -51,6 +51,7 @@ import androidx.compose.material.icons.rounded.FlashlightOn
 import androidx.compose.material.icons.rounded.GridOff
 import androidx.compose.material.icons.rounded.GridOn
 import androidx.compose.material.icons.rounded.PhotoLibrary
+import androidx.compose.material.icons.rounded.Timer
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -98,19 +99,31 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
+import kotlin.math.ceil
 
 private enum class FlashState { OFF, AUTO, ON, TORCH }
+
+private enum class BatchAutoPace(val shortLabel: String, val minCooldownMs: Long, val requirePageSwap: Boolean) {
+    SMART_PAGE_CHANGE("Wait Page", 2000L, true),
+    DELAY_3S("3s", 3200L, false),
+    DELAY_5S("5s", 5200L, false)
+}
+
+private data class FrameAnalysisResult(
+    val quad: NormalizedQuad?,
+    val fingerprint: FloatArray
+)
 
 /**
  * Professional Zero-Latency CameraX Document Scanner:
  * - Unified UseCaseGroup + PreviewView.viewPort guarantees pixel-exact alignment between
  *   live viewfinder, ImageAnalysis cropRect edge tracking, and captured JPEG output.
- * - Dedicated background captureExecutor + 2048px ResolutionSelector + MINIMIZE_LATENCY
- *   achieves ~150ms burst capture with zero UI freeze.
- * - Real-time noise-immune connected-component + convex-hull document edge detection (~14 FPS)
- *   with smooth stability ring and hands-free auto-capture.
- * - Guided 2-in-1 ID Card framing with automatic fallback card crop rect, Tap-to-Focus reticle,
- *   Flash/Torch modes, Rule-of-Thirds grid, and safe lifecycle cleanup.
+ * - Anti-Duplicate Smart Page-Change Gate ("Wait Page" default + 3s / 5s pace selector):
+ *   Never rapidly re-captures the same paper in Batch or ID Card mode; waits until you
+ *   swap/turn the sheet (visual 8x8 luma fingerprint change or paper removal) or finish
+ *   your selected countdown timer, while always allowing instant manual shutter override.
+ * - Dedicated background captureExecutor + 2048px ResolutionSelector + MINIMIZE_LATENCY.
  */
 @Composable
 fun LiveDocumentCameraView(
@@ -133,8 +146,12 @@ fun LiveDocumentCameraView(
     var flashState by remember { mutableStateOf(FlashState.OFF) }
     var showGrid by remember { mutableStateOf(false) }
     var autoCaptureEnabled by remember { mutableStateOf(true) }
+    var batchPace by remember { mutableStateOf(BatchAutoPace.SMART_PAGE_CHANGE) }
     var detectedQuad by remember { mutableStateOf<NormalizedQuad?>(null) }
     var stabilityProgress by remember { mutableFloatStateOf(0f) }
+    var isWaitingForPageSwap by remember { mutableStateOf(false) }
+    var cooldownRemainingSec by remember { mutableIntStateOf(0) }
+    var cooldownProgress by remember { mutableFloatStateOf(0f) }
     var showShutterFlash by remember { mutableStateOf(false) }
     var isCapturing by remember { mutableStateOf(false) }
     var cameraError by remember { mutableStateOf<String?>(null) }
@@ -150,8 +167,13 @@ fun LiveDocumentCameraView(
     val captureExecutor = remember { Executors.newSingleThreadExecutor() }
     val captureInFlight = remember { AtomicBoolean(false) }
     val lastAutoShotMs = remember { AtomicLong(0L) }
+    val pageChangedAtMs = remember { AtomicLong(0L) }
+    val waitingPageSwapFlag = remember { AtomicBoolean(false) }
+    val lastCapturedFingerprint = remember { AtomicReference<FloatArray?>(null) }
+    val latestFrameFingerprint = remember { AtomicReference<FloatArray?>(null) }
 
     val latestAutoEnabled by rememberUpdatedState(autoCaptureEnabled)
+    val latestBatchPace by rememberUpdatedState(batchPace)
     val latestScanMode by rememberUpdatedState(scanMode)
     val latestCapturedCount by rememberUpdatedState(capturedCount)
     val latestDetectedQuad by rememberUpdatedState(detectedQuad)
@@ -212,6 +234,8 @@ fun LiveDocumentCameraView(
             NormalizedQuad.FULL
         }
         val effectiveQuad = quadSnapshot ?: fallbackQuad
+        // Snapshot visual fingerprint at capture time so auto-capture never shoots the same sheet twice
+        val fpAtCapture = latestFrameFingerprint.get()?.copyOf()
         val mainExecutor = ContextCompat.getMainExecutor(context)
 
         ic.takePicture(
@@ -222,10 +246,16 @@ fun LiveDocumentCameraView(
                     val uri = runCatching {
                         FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", photoFile)
                     }.getOrElse { Uri.fromFile(photoFile) }
-                    lastAutoShotMs.set(System.currentTimeMillis())
+                    val now = System.currentTimeMillis()
+                    lastAutoShotMs.set(now)
+                    lastCapturedFingerprint.set(fpAtCapture)
+                    val shouldGatePageSwap = latestScanMode != "single" &&
+                        (latestBatchPace.requirePageSwap || latestScanMode == "idcard")
+                    waitingPageSwapFlag.set(shouldGatePageSwap)
                     captureInFlight.set(false)
                     mainExecutor.execute {
                         stabilityProgress = 0f
+                        isWaitingForPageSwap = shouldGatePageSwap
                         isCapturing = false
                         latestOnCaptured(uri, effectiveQuad)
                     }
@@ -289,7 +319,6 @@ fun LiveDocumentCameraView(
 
                 val providerFuture = ProcessCameraProvider.getInstance(ctx)
                 providerFuture.addListener({
-                    // Post so previewView has measured dimensions and provides a valid ViewPort
                     previewView.post {
                         try {
                             val cameraProvider = providerFuture.get()
@@ -344,50 +373,91 @@ fun LiveDocumentCameraView(
                                     ia.setAnalyzer(analysisExecutor) { imageProxy ->
                                         try {
                                             val now = System.currentTimeMillis()
-                                            // Analyze at ~14 FPS for snappy edge tracking with low battery draw
                                             if (now - lastAnalyzedMs >= 68L) {
                                                 lastAnalyzedMs = now
-                                                val rawQuad = analyzeImageProxyForDocumentQuad(imageProxy)
+                                                val analyzed = analyzeImageProxyFrame(imageProxy)
                                                 val mainExec = ContextCompat.getMainExecutor(ctx)
-                                                if (rawQuad != null) {
-                                                    missedFrames = 0
-                                                    val nextQuad = DocumentEdgeDetector.smoothQuad(smoothedQuad, rawQuad, alpha = 0.42f)
-                                                    val delta = if (smoothedQuad != null) {
-                                                        DocumentEdgeDetector.quadDelta(smoothedQuad!!, nextQuad)
-                                                    } else 1f
-                                                    smoothedQuad = nextQuad
+                                                if (analyzed != null) {
+                                                    latestFrameFingerprint.set(analyzed.fingerprint)
+                                                    val rawQuad = analyzed.quad
+                                                    val pace = latestBatchPace
+                                                    val elapsedSinceShot = now - lastAutoShotMs.get()
 
-                                                    val inCooldown = (now - lastAutoShotMs.get()) < 1350L
-                                                    val canAutoShoot = latestAutoEnabled &&
-                                                        !captureInFlight.get() &&
-                                                        !inCooldown &&
-                                                        !(latestScanMode == "idcard" && latestCapturedCount >= 2)
-
-                                                    val progress = if (canAutoShoot && delta < 0.032f) {
-                                                        if (steadyStartMs == 0L) steadyStartMs = now
-                                                        ((now - steadyStartMs).toFloat() / 620f).coerceIn(0f, 1f)
-                                                    } else {
-                                                        steadyStartMs = 0L
-                                                        0f
-                                                    }
-
-                                                    mainExec.execute {
-                                                        detectedQuad = nextQuad
-                                                        stabilityProgress = progress
-                                                        if (progress >= 1f && canAutoShoot) {
+                                                    // Check if waiting for user to remove/swap/flip the previous sheet
+                                                    if (waitingPageSwapFlag.get()) {
+                                                        val prevFp = lastCapturedFingerprint.get()
+                                                        val sceneDiff = if (prevFp != null) {
+                                                            DocumentEdgeDetector.fingerprintDifference(prevFp, analyzed.fingerprint)
+                                                        } else 1f
+                                                        // Require >= 1.1s after shot AND either paper removed OR noticeable visual change
+                                                        val pageSwapped = elapsedSinceShot >= 1100L &&
+                                                            (rawQuad == null || sceneDiff >= 0.11f)
+                                                        if (pageSwapped) {
+                                                            waitingPageSwapFlag.set(false)
+                                                            pageChangedAtMs.set(now)
                                                             steadyStartMs = 0L
-                                                            triggerInstantCapture(nextQuad)
                                                         }
                                                     }
-                                                } else {
-                                                    // Keep last quad briefly (3 frames) to eliminate flicker
-                                                    missedFrames++
-                                                    if (missedFrames >= 3) {
-                                                        smoothedQuad = null
-                                                        steadyStartMs = 0L
+
+                                                    val waitingSwapNow = waitingPageSwapFlag.get()
+                                                    val remainingCooldownMs = (pace.minCooldownMs - elapsedSinceShot).coerceAtLeast(0L)
+                                                    val settleSinceSwapMs = now - pageChangedAtMs.get()
+                                                    val settlingAfterSwap = pageChangedAtMs.get() > 0L && settleSinceSwapMs < 750L
+                                                    val inCooldown = remainingCooldownMs > 0L || settlingAfterSwap
+
+                                                    val remSec = if (!waitingSwapNow && remainingCooldownMs > 0L && lastAutoShotMs.get() > 0L) {
+                                                        ceil(remainingCooldownMs / 1000.0).toInt()
+                                                    } else 0
+                                                    val cdProg = if (!waitingSwapNow && remainingCooldownMs > 0L && lastAutoShotMs.get() > 0L) {
+                                                        (remainingCooldownMs.toFloat() / pace.minCooldownMs.toFloat()).coerceIn(0f, 1f)
+                                                    } else 0f
+
+                                                    if (rawQuad != null) {
+                                                        missedFrames = 0
+                                                        val nextQuad = DocumentEdgeDetector.smoothQuad(smoothedQuad, rawQuad, alpha = 0.42f)
+                                                        val delta = if (smoothedQuad != null) {
+                                                            DocumentEdgeDetector.quadDelta(smoothedQuad!!, nextQuad)
+                                                        } else 1f
+                                                        smoothedQuad = nextQuad
+
+                                                        val canAutoShoot = latestAutoEnabled &&
+                                                            !captureInFlight.get() &&
+                                                            !waitingSwapNow &&
+                                                            !inCooldown &&
+                                                            !(latestScanMode == "idcard" && latestCapturedCount >= 2)
+
+                                                        // Smooth 850ms steady hold prevents premature jitter shots
+                                                        val progress = if (canAutoShoot && delta < 0.028f) {
+                                                            if (steadyStartMs == 0L) steadyStartMs = now
+                                                            ((now - steadyStartMs).toFloat() / 850f).coerceIn(0f, 1f)
+                                                        } else {
+                                                            steadyStartMs = 0L
+                                                            0f
+                                                        }
+
                                                         mainExec.execute {
-                                                            detectedQuad = null
-                                                            stabilityProgress = 0f
+                                                            detectedQuad = nextQuad
+                                                            isWaitingForPageSwap = waitingSwapNow
+                                                            cooldownRemainingSec = remSec
+                                                            cooldownProgress = cdProg
+                                                            stabilityProgress = progress
+                                                            if (progress >= 1f && canAutoShoot) {
+                                                                steadyStartMs = 0L
+                                                                triggerInstantCapture(nextQuad)
+                                                            }
+                                                        }
+                                                    } else {
+                                                        missedFrames++
+                                                        if (missedFrames >= 3) {
+                                                            smoothedQuad = null
+                                                            steadyStartMs = 0L
+                                                            mainExec.execute {
+                                                                detectedQuad = null
+                                                                isWaitingForPageSwap = waitingSwapNow
+                                                                cooldownRemainingSec = remSec
+                                                                cooldownProgress = cdProg
+                                                                stabilityProgress = 0f
+                                                            }
                                                         }
                                                     }
                                                 }
@@ -414,7 +484,6 @@ fun LiveDocumentCameraView(
                             imageCaptureUseCase = imageCapture
                             cameraError = null
 
-                            // Tap-to-focus with visual animated reticle
                             previewView.setOnTouchListener { view, event ->
                                 if (event.action == MotionEvent.ACTION_UP) {
                                     val point = previewView.meteringPointFactory.createPoint(event.x, event.y)
@@ -458,7 +527,7 @@ fun LiveDocumentCameraView(
                 val left = (w - cardW) / 2f
                 val top = (h - cardH) / 2f
                 drawRoundRect(
-                    color = Color(0xFF38BDF8),
+                    color = if (isWaitingForPageSwap) Color(0xFFF59E0B) else Color(0xFF38BDF8),
                     topLeft = Offset(left, top),
                     size = Size(cardW, cardH),
                     cornerRadius = CornerRadius(16.dp.toPx()),
@@ -473,9 +542,14 @@ fun LiveDocumentCameraView(
                 val p2 = Offset(q.brX * w, q.brY * h)
                 val p3 = Offset(q.blX * w, q.blY * h)
 
-                val locking = animatedStability > 0.18f
-                val strokeColor = if (locking) Color(0xFF22C55E) else Color(0xFF38BDF8)
-                val fillColor = strokeColor.copy(alpha = if (locking) 0.22f else 0.13f)
+                val pausedForNext = autoCaptureEnabled && (isWaitingForPageSwap || cooldownRemainingSec > 0)
+                val locking = animatedStability > 0.16f
+                val strokeColor = when {
+                    pausedForNext -> Color(0xFFF59E0B) // Warm amber while waiting for user to swap paper
+                    locking -> Color(0xFF22C55E)       // Emerald green while locking onto new page
+                    else -> Color(0xFF38BDF8)          // Crisp cyan tracking
+                }
+                val fillColor = strokeColor.copy(alpha = if (locking) 0.22f else 0.12f)
 
                 val path = Path().apply {
                     moveTo(p0.x, p0.y)
@@ -488,7 +562,7 @@ fun LiveDocumentCameraView(
                 drawPath(path, color = strokeColor, style = Stroke(width = 3.dp.toPx()))
 
                 listOf(p0, p1, p2, p3).forEach { corner ->
-                    drawCircle(color = strokeColor.copy(alpha = 0.28f), radius = 12.dp.toPx(), center = corner)
+                    drawCircle(color = strokeColor.copy(alpha = 0.26f), radius = 12.dp.toPx(), center = corner)
                     drawCircle(color = Color.White, radius = 6.5.dp.toPx(), center = corner)
                     drawCircle(color = strokeColor, radius = 4.dp.toPx(), center = corner)
                 }
@@ -547,9 +621,9 @@ fun LiveDocumentCameraView(
             modifier = Modifier
                 .align(Alignment.TopCenter)
                 .fillMaxWidth()
-                .background(Color.Black.copy(alpha = 0.48f))
+                .background(Color.Black.copy(alpha = 0.52f))
                 .statusBarsPadding()
-                .padding(horizontal = 10.dp, vertical = 8.dp),
+                .padding(horizontal = 8.dp, vertical = 8.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             Row(
@@ -559,12 +633,12 @@ fun LiveDocumentCameraView(
             ) {
                 IconButton(
                     onClick = onClose,
-                    modifier = Modifier.size(48.dp).testTag("live_scanner_close_btn")
+                    modifier = Modifier.size(44.dp).testTag("live_scanner_close_btn")
                 ) {
                     Icon(Icons.Rounded.Close, contentDescription = "Close Scanner", tint = Color.White)
                 }
 
-                Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                Row(horizontalArrangement = Arrangement.spacedBy(5.dp), verticalAlignment = Alignment.CenterVertically) {
                     // Flash / Torch Cycle
                     Surface(
                         color = if (flashState != FlashState.OFF) Color(0xFFF59E0B).copy(alpha = 0.25f) else Color.White.copy(alpha = 0.14f),
@@ -578,9 +652,9 @@ fun LiveDocumentCameraView(
                             .testTag("live_scanner_flash_btn")
                     ) {
                         Row(
-                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 7.dp),
                             verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                            horizontalArrangement = Arrangement.spacedBy(3.dp)
                         ) {
                             Icon(
                                 imageVector = when (flashState) {
@@ -591,7 +665,7 @@ fun LiveDocumentCameraView(
                                 },
                                 contentDescription = "Flash mode ${flashState.name}",
                                 tint = if (flashState != FlashState.OFF) Color(0xFFFBBF24) else Color.White,
-                                modifier = Modifier.size(18.dp)
+                                modifier = Modifier.size(16.dp)
                             )
                             Text(
                                 text = when (flashState) {
@@ -610,13 +684,55 @@ fun LiveDocumentCameraView(
                     // Grid Overlay Toggle
                     IconButton(
                         onClick = { showGrid = !showGrid },
-                        modifier = Modifier.size(44.dp).testTag("live_scanner_grid_btn")
+                        modifier = Modifier.size(38.dp).testTag("live_scanner_grid_btn")
                     ) {
                         Icon(
                             if (showGrid) Icons.Rounded.GridOn else Icons.Rounded.GridOff,
                             contentDescription = "Toggle Grid",
-                            tint = if (showGrid) Color(0xFF38BDF8) else Color.White
+                            tint = if (showGrid) Color(0xFF38BDF8) else Color.White,
+                            modifier = Modifier.size(20.dp)
                         )
+                    }
+
+                    // Batch Auto-Pace Selector (Wait Page / 3s / 5s) when AUTO is enabled
+                    if (autoCaptureEnabled && scanMode != "single") {
+                        Surface(
+                            color = Color(0xFF0EA5E9).copy(alpha = 0.24f),
+                            shape = RoundedCornerShape(12.dp),
+                            modifier = Modifier
+                                .border(1.dp, Color(0xFF38BDF8).copy(alpha = 0.65f), RoundedCornerShape(12.dp))
+                                .clip(RoundedCornerShape(12.dp))
+                                .clickable {
+                                    val all = BatchAutoPace.entries
+                                    val next = all[(all.indexOf(batchPace) + 1) % all.size]
+                                    batchPace = next
+                                    if (!next.requirePageSwap) {
+                                        waitingPageSwapFlag.set(false)
+                                        isWaitingForPageSwap = false
+                                    }
+                                    haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                }
+                                .testTag("live_scanner_pace_btn")
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 7.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(3.dp)
+                            ) {
+                                Icon(
+                                    Icons.Rounded.Timer,
+                                    contentDescription = "Change batch auto-capture pace",
+                                    tint = Color(0xFF38BDF8),
+                                    modifier = Modifier.size(15.dp)
+                                )
+                                Text(
+                                    text = batchPace.shortLabel,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = Color.White,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                        }
                     }
 
                     // Auto vs Manual Shutter Toggle
@@ -630,19 +746,27 @@ fun LiveDocumentCameraView(
                                 RoundedCornerShape(12.dp)
                             )
                             .clip(RoundedCornerShape(12.dp))
-                            .clickable { autoCaptureEnabled = !autoCaptureEnabled }
+                            .clickable {
+                                autoCaptureEnabled = !autoCaptureEnabled
+                                if (!autoCaptureEnabled) {
+                                    waitingPageSwapFlag.set(false)
+                                    isWaitingForPageSwap = false
+                                    cooldownRemainingSec = 0
+                                    stabilityProgress = 0f
+                                }
+                            }
                             .testTag("live_scanner_auto_toggle")
                     ) {
                         Row(
-                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 7.dp),
                             verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                            horizontalArrangement = Arrangement.spacedBy(3.dp)
                         ) {
                             Icon(
                                 Icons.Rounded.AutoAwesome,
                                 contentDescription = "Toggle Auto Capture",
                                 tint = if (autoCaptureEnabled) Color(0xFF4ADE80) else Color.White,
-                                modifier = Modifier.size(16.dp)
+                                modifier = Modifier.size(15.dp)
                             )
                             Text(
                                 text = if (autoCaptureEnabled) "AUTO" else "MANUAL",
@@ -657,23 +781,36 @@ fun LiveDocumentCameraView(
 
             // Live Guidance Pill
             Spacer(Modifier.height(6.dp))
+            val isWaitingState = autoCaptureEnabled && (isWaitingForPageSwap || cooldownRemainingSec > 0)
             val statusText = when {
                 scanMode == "idcard" && capturedCount == 0 -> "Align FRONT of ID Card inside frame"
-                scanMode == "idcard" && capturedCount == 1 -> "Now flip & align BACK of ID Card"
+                scanMode == "idcard" && capturedCount == 1 && isWaitingForPageSwap -> "Front saved · Flip card to BACK side"
+                scanMode == "idcard" && capturedCount == 1 -> "Align BACK of ID Card — hold steady"
                 scanMode == "idcard" && capturedCount >= 2 -> "Both sides captured · Tap Review →"
-                animatedStability > 0.18f -> "Hold steady — Auto-capturing…"
+                !autoCaptureEnabled -> "Manual Mode · Tap shutter when ready"
+                isWaitingForPageSwap -> "Page $capturedCount saved · Swap paper for next scan"
+                cooldownRemainingSec > 0 -> "Page $capturedCount saved · Change paper (${cooldownRemainingSec}s)"
+                animatedStability > 0.16f -> "Hold steady — Capturing Page ${capturedCount + 1}…"
                 detectedQuad != null -> "Edges locked · Hold steady or tap shutter"
                 else -> "Point at document · Tap anywhere to focus"
             }
+            val pillColor = when {
+                isWaitingState -> Color(0xFFFBBF24)
+                animatedStability > 0.16f -> Color(0xFF4ADE80)
+                else -> Color.White
+            }
             Surface(
-                color = Color.Black.copy(alpha = 0.62f),
-                shape = RoundedCornerShape(999.dp)
+                color = if (isWaitingState) Color(0xCC451A03) else Color.Black.copy(alpha = 0.64f),
+                shape = RoundedCornerShape(999.dp),
+                modifier = if (isWaitingState) {
+                    Modifier.border(1.dp, Color(0xFFF59E0B).copy(alpha = 0.7f), RoundedCornerShape(999.dp))
+                } else Modifier
             ) {
                 Text(
                     text = statusText,
                     style = MaterialTheme.typography.labelMedium,
-                    color = if (animatedStability > 0.18f) Color(0xFF4ADE80) else Color.White,
-                    fontWeight = FontWeight.Medium,
+                    color = pillColor,
+                    fontWeight = FontWeight.SemiBold,
                     modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp)
                 )
             }
@@ -690,7 +827,6 @@ fun LiveDocumentCameraView(
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            // Mode Selector Pills (Batch / Single / ID Card)
             if (!isAppendMode) {
                 Row(
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -707,7 +843,12 @@ fun LiveDocumentCameraView(
                             shape = RoundedCornerShape(999.dp),
                             modifier = Modifier
                                 .clip(RoundedCornerShape(999.dp))
-                                .clickable { onScanModeChange(id) }
+                                .clickable {
+                                    waitingPageSwapFlag.set(false)
+                                    isWaitingForPageSwap = false
+                                    cooldownRemainingSec = 0
+                                    onScanModeChange(id)
+                                }
                                 .testTag("live_scanner_mode_$id")
                         ) {
                             Text(
@@ -722,7 +863,6 @@ fun LiveDocumentCameraView(
                 }
             }
 
-            // Main Action Row
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
@@ -758,13 +898,14 @@ fun LiveDocumentCameraView(
                     }
                 }
 
-                // Center: Instant Shutter Button with Auto-Capture Stability Ring
+                // Center: Instant Shutter Button with Emerald Auto-Capture Lock Ring OR Amber Cooldown Countdown Arc
                 Box(
                     contentAlignment = Alignment.Center,
                     modifier = Modifier
                         .size(78.dp)
                         .clip(CircleShape)
                         .clickable(enabled = !isCapturing) {
+                            // Manual tap always overrides waiting/cooldown immediately
                             triggerInstantCapture(latestDetectedQuad)
                         }
                         .testTag("live_scanner_shutter_btn")
@@ -774,7 +915,15 @@ fun LiveDocumentCameraView(
                             color = Color.White.copy(alpha = 0.35f),
                             style = Stroke(width = 4.dp.toPx())
                         )
-                        if (animatedStability > 0.02f) {
+                        if (autoCaptureEnabled && cooldownProgress > 0.02f && !isWaitingForPageSwap) {
+                            drawArc(
+                                color = Color(0xFFF59E0B),
+                                startAngle = -90f,
+                                sweepAngle = cooldownProgress * 360f,
+                                useCenter = false,
+                                style = Stroke(width = 5.dp.toPx(), cap = StrokeCap.Round)
+                            )
+                        } else if (animatedStability > 0.02f) {
                             drawArc(
                                 color = Color(0xFF22C55E),
                                 startAngle = -90f,
@@ -785,11 +934,21 @@ fun LiveDocumentCameraView(
                         }
                     }
                     Box(
+                        contentAlignment = Alignment.Center,
                         modifier = Modifier
                             .size(62.dp)
                             .clip(CircleShape)
                             .background(if (isCapturing) Color(0xFF38BDF8) else Color.White)
-                    )
+                    ) {
+                        if (autoCaptureEnabled && cooldownRemainingSec > 0 && !isWaitingForPageSwap) {
+                            Text(
+                                text = "${cooldownRemainingSec}s",
+                                style = MaterialTheme.typography.titleMedium,
+                                color = Color(0xFF0F172A),
+                                fontWeight = FontWeight.ExtraBold
+                            )
+                        }
+                    }
                 }
 
                 // Right: Live Captured Page Stack / Review Studio Pill
@@ -857,11 +1016,10 @@ fun LiveDocumentCameraView(
 }
 
 /**
- * Viewport-aligned zero-JPEG downsampler reading CameraX YUV_420_888 plane 0 (pure luma)
- * strictly inside [ImageProxy.getCropRect] so normalized [0..1] quad coordinates match
- * PreviewView and UseCaseGroup-cropped ImageCapture outputs pixel-for-pixel.
+ * Single-pass viewport-aligned Y-plane analyzer computing BOTH the document quad
+ * AND the 8x8 visual page-change fingerprint directly inside [ImageProxy.getCropRect].
  */
-private fun analyzeImageProxyForDocumentQuad(imageProxy: ImageProxy): NormalizedQuad? {
+private fun analyzeImageProxyFrame(imageProxy: ImageProxy): FrameAnalysisResult? {
     val plane = imageProxy.planes.firstOrNull() ?: return null
     val srcW = imageProxy.width
     val srcH = imageProxy.height
@@ -893,7 +1051,6 @@ private fun analyzeImageProxyForDocumentQuad(imageProxy: ImageProxy): Normalized
         val ny = (ty + 0.5f) / targetH
         for (tx in 0 until targetW) {
             val nx = (tx + 0.5f) / targetW
-            // Map display-oriented (nx, ny) back to sensor cropRect coordinates
             val (sxNorm, syNorm) = when (rot) {
                 90 -> ny to (1f - nx)
                 180 -> (1f - nx) to (1f - ny)
@@ -907,5 +1064,7 @@ private fun analyzeImageProxyForDocumentQuad(imageProxy: ImageProxy): Normalized
         }
     }
 
-    return DocumentEdgeDetector.detectFromLumaGrid(grid, targetW, targetH)
+    val quad = DocumentEdgeDetector.detectFromLumaGrid(grid, targetW, targetH)
+    val fp = DocumentEdgeDetector.computeLumaFingerprint(grid, targetW, targetH)
+    return FrameAnalysisResult(quad = quad, fingerprint = fp)
 }

@@ -3,6 +3,10 @@ package com.filelenspro.app.ui.components
 import android.graphics.Bitmap
 import android.net.Uri
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.snap
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.Canvas
@@ -12,6 +16,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -31,13 +36,17 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.RotateRight
+import androidx.compose.material.icons.automirrored.rounded.Undo
+import androidx.compose.material.icons.rounded.AspectRatio
 import androidx.compose.material.icons.rounded.AutoFixHigh
 import androidx.compose.material.icons.rounded.CenterFocusStrong
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.Compare
 import androidx.compose.material.icons.rounded.Crop
 import androidx.compose.material.icons.rounded.CropFree
 import androidx.compose.material.icons.rounded.Visibility
+import androidx.compose.material.icons.rounded.WarningAmber
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -53,6 +62,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -71,6 +81,7 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.clipPath
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
@@ -102,14 +113,27 @@ private val CROP_PREVIEW_FILTERS = listOf(
     "original" to "Photo"
 )
 
+private enum class CropAspectPreset(val label: String, val ratio: Float?) {
+    AUTO_3D("Auto 3D", null),
+    A4("A4 Sheet", 0.707f),
+    ID_CARD("ID Card", 1.586f)
+}
+
+private data class CropUndoSnapshot(
+    val quad: NormalizedQuad,
+    val rotationDeg: Int
+)
+
 /**
- * Genius Scan / Google Docs Scanner–class Interactive 4-Corner Perspective Straightener:
- * - Zero-jump relative delta dragging on all 4 corners, 4 angled capsule edge bars, and whole-quad pan
- * - 3.0× precision circular Magnifier Loupe with live converging polygon edge rays & pixel crosshair
- * - Optional Harris-based Magnetic Corner Snap (locks corners cleanly onto crisp paper vertices)
- * - Zhang & He projective aspect-ratio recovery + Matrix.setPolyToPoly homography live Preview
- * - Press-and-hold Original vs Straightened comparison + instant scan filter switching in Preview
- * - Instant RGB+Luma Auto Detect, Full Frame reset, and synchronized Rotate 90°
+ * Pro-Level Genius Scan / Google Docs Scanner Interactive 4-Corner Perspective Straightener:
+ * - Zero-freeze relative delta dragging on all 4 corners + red invalid-shape convexity guard
+ * - Perspective-ray edge-bar sliding along adjacent converging document edges
+ * - Smooth animated Auto / Full / Undo / Magnetic Snap transitions (0ms immediate during drag)
+ * - Finger-tracking 3.5× circular Magnifier Loupe floating above the active corner (auto-flipping
+ *   near screen edges) with live converging polygon border rays & precision crosshair
+ * - Undo history stack for corners & rotations
+ * - Live shadow-free Magic Color / B&W Preview with Proportion Lock (Auto 3D / A4 / ID Card),
+ *   pinch-to-zoom, double-tap zoom, and hold-to-compare Original
  */
 @Composable
 fun PerspectiveCropDialog(
@@ -133,6 +157,9 @@ fun PerspectiveCropDialog(
     var displayQuad by remember(imageUri, initialQuad, initialRotationDeg) {
         mutableStateOf(DocumentEdgeDetector.rotateQuadCW(initialQuad, initialRotationDeg))
     }
+    var undoStack by remember(imageUri) { mutableStateOf<List<CropUndoSnapshot>>(emptyList()) }
+    var dragStartSnapshot by remember { mutableStateOf<CropUndoSnapshot?>(null) }
+
     // 0..3 = TL/TR/BR/BL corners; 4..7 = Top/Right/Bottom/Left edge bars; 8 = whole-quad pan; -1 = idle
     var activeHandle by remember { mutableIntStateOf(-1) }
     var containerSize by remember { mutableStateOf(IntSize.Zero) }
@@ -144,8 +171,22 @@ fun PerspectiveCropDialog(
     var isHoldingCompareOriginal by remember { mutableStateOf(false) }
     var previewBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var isRenderingPreview by remember { mutableStateOf(false) }
+    var selectedAspect by remember(imageUri) { mutableStateOf(CropAspectPreset.AUTO_3D) }
+    var previewZoom by remember { mutableFloatStateOf(1f) }
+    var previewPan by remember { mutableStateOf(Offset.Zero) }
     var statusBadge by remember { mutableStateOf<String?>(null) }
     var statusBadgeKey by remember { mutableIntStateOf(0) }
+
+    val isQuadValid = remember(displayQuad) {
+        DocumentEdgeDetector.isConvexForWarp(displayQuad)
+    }
+
+    fun pushUndo(snapshot: CropUndoSnapshot = CropUndoSnapshot(displayQuad, currentRotation)) {
+        val last = undoStack.lastOrNull()
+        if (last != snapshot) {
+            undoStack = (undoStack + snapshot).takeLast(20)
+        }
+    }
 
     fun flashStatus(msg: String) {
         statusBadge = msg
@@ -158,6 +199,27 @@ fun PerspectiveCropDialog(
             statusBadge = null
         }
     }
+
+    // Reset preview zoom when leaving preview mode or changing filter/aspect
+    LaunchedEffect(isPreviewMode, selectedAspect) {
+        previewZoom = 1f
+        previewPan = Offset.Zero
+    }
+
+    // Smooth animated coordinates for Auto/Full/Undo/Snap; 0ms immediate during active finger drag
+    val animSpec = if (activeHandle >= 0) {
+        snap<Float>()
+    } else {
+        tween<Float>(durationMillis = 210, easing = FastOutSlowInEasing)
+    }
+    val animTlX by animateFloatAsState(displayQuad.tlX, animSpec, label = "tlX")
+    val animTlY by animateFloatAsState(displayQuad.tlY, animSpec, label = "tlY")
+    val animTrX by animateFloatAsState(displayQuad.trX, animSpec, label = "trX")
+    val animTrY by animateFloatAsState(displayQuad.trY, animSpec, label = "trY")
+    val animBrX by animateFloatAsState(displayQuad.brX, animSpec, label = "brX")
+    val animBrY by animateFloatAsState(displayQuad.brY, animSpec, label = "brY")
+    val animBlX by animateFloatAsState(displayQuad.blX, animSpec, label = "blX")
+    val animBlY by animateFloatAsState(displayQuad.blY, animSpec, label = "blY")
 
     // Decode exact EXIF-corrected + rotated bitmap once per rotation change + compute edge corner map
     LaunchedEffect(imageUri, currentRotation) {
@@ -172,9 +234,9 @@ fun PerspectiveCropDialog(
         } else null
     }
 
-    // Render live straightened + filtered preview bitmap when Preview mode is active
-    LaunchedEffect(isPreviewMode, displayQuad, currentRotation, currentFilter) {
-        if (isPreviewMode) {
+    // Render live straightened + shadow-free filtered preview bitmap when Preview mode is active
+    LaunchedEffect(isPreviewMode, displayQuad, currentRotation, currentFilter, selectedAspect) {
+        if (isPreviewMode && DocumentEdgeDetector.isConvexForWarp(displayQuad)) {
             isRenderingPreview = true
             val unrotatedQuad = DocumentEdgeDetector.rotateQuadInverse(displayQuad, currentRotation)
             val rendered = engine.renderPagePreviewBitmap(
@@ -182,7 +244,8 @@ fun PerspectiveCropDialog(
                 quad = unrotatedQuad,
                 filter = currentFilter,
                 rotationDeg = currentRotation,
-                maxDim = 1280
+                maxDim = 1280,
+                forcedAspectRatio = selectedAspect.ratio
             )
             val oldPrev = previewBitmap
             previewBitmap = rendered
@@ -230,13 +293,14 @@ fun PerspectiveCropDialog(
     }
 
     val latestQuad by rememberUpdatedState(displayQuad)
+    val latestRotation by rememberUpdatedState(currentRotation)
     val latestRect by rememberUpdatedState(imageRect)
     val latestPreviewMode by rememberUpdatedState(isPreviewMode)
     val latestCornerMap by rememberUpdatedState(cornerMap)
     val latestMagnetSnap by rememberUpdatedState(magnetSnapEnabled)
 
-    val cornerHitPx = with(density) { 56.dp.toPx() }
-    val edgeHitPx = with(density) { 38.dp.toPx() }
+    val cornerHitPx = with(density) { 58.dp.toPx() }
+    val edgeHitPx = with(density) { 40.dp.toPx() }
 
     Dialog(
         onDismissRequest = onDismiss,
@@ -255,9 +319,9 @@ fun PerspectiveCropDialog(
                 modifier = Modifier
                     .fillMaxWidth()
                     .background(Color(0xFF0D1424))
-                    .padding(horizontal = 8.dp, vertical = 8.dp),
+                    .padding(horizontal = 6.dp, vertical = 8.dp),
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                horizontalArrangement = Arrangement.spacedBy(4.dp)
             ) {
                 IconButton(onClick = onDismiss, modifier = Modifier.size(48.dp)) {
                     Icon(Icons.Rounded.Close, contentDescription = "Cancel Straightening", tint = Color.White)
@@ -267,15 +331,43 @@ fun PerspectiveCropDialog(
                         text = "Straighten · $pageLabel",
                         style = MaterialTheme.typography.titleMedium,
                         color = Color.White,
-                        fontWeight = FontWeight.Bold
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 1
                     )
                     Text(
-                        text = if (isPreviewMode) "Hold image to compare Original"
-                        else "Drag corners, edge bars, or inside frame",
+                        text = when {
+                            isPreviewMode -> "Pinch to zoom · Double-tap to reset"
+                            !isQuadValid -> "Corners overlap — drag to fix"
+                            else -> "Drag corners or slide perspective edges"
+                        },
                         style = MaterialTheme.typography.labelSmall,
-                        color = Color(0xFF94A3B8)
+                        color = if (!isPreviewMode && !isQuadValid) Color(0xFFFCA5A5) else Color(0xFF94A3B8),
+                        maxLines = 1
                     )
                 }
+
+                // Undo button
+                if (!isPreviewMode && undoStack.isNotEmpty()) {
+                    IconButton(
+                        onClick = {
+                            val prev = undoStack.lastOrNull() ?: return@IconButton
+                            undoStack = undoStack.dropLast(1)
+                            currentRotation = prev.rotationDeg
+                            displayQuad = prev.quad
+                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                            flashStatus("Undid last adjustment")
+                        },
+                        modifier = Modifier.size(44.dp).testTag("crop_undo_btn")
+                    ) {
+                        Icon(
+                            Icons.AutoMirrored.Rounded.Undo,
+                            contentDescription = "Undo last crop change",
+                            tint = Color(0xFFE2E8F0)
+                        )
+                    }
+                }
+
+                // Magnetic corner snap toggle
                 if (!isPreviewMode) {
                     Surface(
                         color = if (magnetSnapEnabled) Color(0xFF0EA5E9).copy(alpha = 0.22f) else Color.White.copy(alpha = 0.10f),
@@ -290,12 +382,12 @@ fun PerspectiveCropDialog(
                             .clickable {
                                 magnetSnapEnabled = !magnetSnapEnabled
                                 haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                flashStatus(if (magnetSnapEnabled) "Magnetic Corner Snap ON" else "Freehand Manual Mode")
+                                flashStatus(if (magnetSnapEnabled) "Magnetic Corner Snap ON" else "Freehand Precision Mode")
                             }
                             .testTag("crop_snap_toggle_btn")
                     ) {
                         Row(
-                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
+                            modifier = Modifier.padding(horizontal = 9.dp, vertical = 7.dp),
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.spacedBy(4.dp)
                         ) {
@@ -314,14 +406,20 @@ fun PerspectiveCropDialog(
                         }
                     }
                 }
+
                 Button(
+                    enabled = isQuadValid,
                     onClick = {
                         haptics.performHapticFeedback(HapticFeedbackType.LongPress)
                         val unrotated = DocumentEdgeDetector.rotateQuadInverse(displayQuad, currentRotation)
                         onApply(unrotated, currentRotation, currentFilter)
                     },
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF16A34A)),
-                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color(0xFF16A34A),
+                        disabledContainerColor = Color(0xFF334155),
+                        disabledContentColor = Color(0xFF94A3B8)
+                    ),
+                    contentPadding = PaddingValues(horizontal = 13.dp, vertical = 8.dp),
                     modifier = Modifier.testTag("crop_apply_btn")
                 ) {
                     Icon(Icons.Rounded.Check, contentDescription = null, modifier = Modifier.size(18.dp))
@@ -339,11 +437,33 @@ fun PerspectiveCropDialog(
                     .onSizeChanged { containerSize = it }
                     .pointerInput(isPreviewMode) {
                         if (isPreviewMode) {
+                            detectTransformGestures { _, pan, zoom, _ ->
+                                val nextZoom = (previewZoom * zoom).coerceIn(1f, 3.5f)
+                                previewZoom = nextZoom
+                                if (nextZoom <= 1.02f) {
+                                    previewPan = Offset.Zero
+                                } else {
+                                    val maxX = (size.width * (nextZoom - 1f)) / 2f
+                                    val maxY = (size.height * (nextZoom - 1f)) / 2f
+                                    previewPan = Offset(
+                                        (previewPan.x + pan.x).coerceIn(-maxX, maxX),
+                                        (previewPan.y + pan.y).coerceIn(-maxY, maxY)
+                                    )
+                                }
+                            }
+                        }
+                    }
+                    .pointerInput(isPreviewMode) {
+                        if (isPreviewMode) {
                             detectTapGestures(
-                                onPress = {
-                                    isHoldingCompareOriginal = true
-                                    tryAwaitRelease()
-                                    isHoldingCompareOriginal = false
+                                onDoubleTap = {
+                                    if (previewZoom > 1.15f) {
+                                        previewZoom = 1f
+                                        previewPan = Offset.Zero
+                                    } else {
+                                        previewZoom = 2.2f
+                                    }
+                                    haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                                 }
                             )
                         }
@@ -378,12 +498,13 @@ fun PerspectiveCropDialog(
                                     }
                                 }
                                 if (bestCornerDist <= cornerHitPx) {
+                                    dragStartSnapshot = CropUndoSnapshot(q, latestRotation)
                                     activeHandle = bestCorner
                                     haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                                     return@detectDragGestures
                                 }
 
-                                // 2. Secondary: 4 edge midpoint capsule bars
+                                // 2. Secondary: 4 perspective-aware edge midpoint capsule bars
                                 var bestEdge = -1
                                 var bestEdgeDist = Float.MAX_VALUE
                                 mids.forEachIndexed { idx, pt ->
@@ -394,6 +515,7 @@ fun PerspectiveCropDialog(
                                     }
                                 }
                                 if (bestEdgeDist <= edgeHitPx) {
+                                    dragStartSnapshot = CropUndoSnapshot(q, latestRotation)
                                     activeHandle = bestEdge
                                     haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                                     return@detectDragGestures
@@ -401,41 +523,53 @@ fun PerspectiveCropDialog(
 
                                 // 3. Tertiary: Inside polygon pan (only if not full frame)
                                 if (!q.isFullFrame() && isPointInQuad(startPos, p0, p1, p2, p3)) {
+                                    dragStartSnapshot = CropUndoSnapshot(q, latestRotation)
                                     activeHandle = 8
                                     haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                                 } else {
+                                    dragStartSnapshot = null
                                     activeHandle = -1
                                 }
                             },
                             onDragEnd = {
                                 val released = activeHandle
+                                val startSnap = dragStartSnapshot
                                 activeHandle = -1
-                                // Subtle Genius Scan-style magnetic corner snap on release
+                                dragStartSnapshot = null
+
+                                // Genius Scan-style magnetic corner snap on release
                                 val map = latestCornerMap
+                                var finalQuad = latestQuad
                                 if (latestMagnetSnap && map != null && released in 0..3) {
-                                    val q = latestQuad
                                     val (curX, curY) = when (released) {
-                                        0 -> q.tlX to q.tlY
-                                        1 -> q.trX to q.trY
-                                        2 -> q.brX to q.brY
-                                        else -> q.blX to q.blY
+                                        0 -> finalQuad.tlX to finalQuad.tlY
+                                        1 -> finalQuad.trX to finalQuad.trY
+                                        2 -> finalQuad.brX to finalQuad.brY
+                                        else -> finalQuad.blX to finalQuad.blY
                                     }
                                     val (sx, sy) = DocumentEdgeDetector.snapCornerToEdge(curX, curY, map)
                                     if (sx != curX || sy != curY) {
                                         val snapped = when (released) {
-                                            0 -> q.copy(tlX = sx, tlY = sy)
-                                            1 -> q.copy(trX = sx, trY = sy)
-                                            2 -> q.copy(brX = sx, brY = sy)
-                                            else -> q.copy(blX = sx, blY = sy)
+                                            0 -> finalQuad.copy(tlX = sx, tlY = sy)
+                                            1 -> finalQuad.copy(trX = sx, trY = sy)
+                                            2 -> finalQuad.copy(brX = sx, brY = sy)
+                                            else -> finalQuad.copy(blX = sx, blY = sy)
                                         }
                                         if (DocumentEdgeDetector.isConvexForWarp(snapped)) {
+                                            finalQuad = snapped
                                             displayQuad = snapped
                                             haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                                         }
                                     }
                                 }
+                                if (startSnap != null && startSnap.quad != finalQuad) {
+                                    pushUndo(startSnap)
+                                }
                             },
-                            onDragCancel = { activeHandle = -1 },
+                            onDragCancel = {
+                                activeHandle = -1
+                                dragStartSnapshot = null
+                            },
                             onDrag = { change, dragAmount ->
                                 val idx = activeHandle
                                 val rect = latestRect
@@ -448,44 +582,35 @@ fun PerspectiveCropDialog(
                                 val dx = dragAmount.x / rect.width
                                 val dy = dragAmount.y / rect.height
 
-                                val candidate = when (idx) {
-                                    0 -> q.copy(tlX = (q.tlX + dx).coerceIn(0f, 1f), tlY = (q.tlY + dy).coerceIn(0f, 1f))
-                                    1 -> q.copy(trX = (q.trX + dx).coerceIn(0f, 1f), trY = (q.trY + dy).coerceIn(0f, 1f))
-                                    2 -> q.copy(brX = (q.brX + dx).coerceIn(0f, 1f), brY = (q.brY + dy).coerceIn(0f, 1f))
-                                    3 -> q.copy(blX = (q.blX + dx).coerceIn(0f, 1f), blY = (q.blY + dy).coerceIn(0f, 1f))
-                                    4 -> { // Top edge bar
-                                        val allowedDy = dy.coerceIn(-minOf(q.tlY, q.trY), 1f - maxOf(q.tlY, q.trY))
-                                        q.copy(tlY = q.tlY + allowedDy, trY = q.trY + allowedDy)
+                                when (idx) {
+                                    // Zero-freeze free corner movement: always tracks finger smoothly;
+                                    // crimson red convexity guard warns if corners become concave/crossed
+                                    0 -> displayQuad = q.copy(tlX = (q.tlX + dx).coerceIn(0f, 1f), tlY = (q.tlY + dy).coerceIn(0f, 1f))
+                                    1 -> displayQuad = q.copy(trX = (q.trX + dx).coerceIn(0f, 1f), trY = (q.trY + dy).coerceIn(0f, 1f))
+                                    2 -> displayQuad = q.copy(brX = (q.brX + dx).coerceIn(0f, 1f), brY = (q.brY + dy).coerceIn(0f, 1f))
+                                    3 -> displayQuad = q.copy(blX = (q.blX + dx).coerceIn(0f, 1f), blY = (q.blY + dy).coerceIn(0f, 1f))
+                                    // Perspective-ray edge-bar sliding along converging left/right/top/bottom sides
+                                    in 4..7 -> {
+                                        val slid = DocumentEdgeDetector.slideEdgeAlongPerspective(q, idx - 4, dx, dy)
+                                        if (DocumentEdgeDetector.isConvexForWarp(slid)) {
+                                            displayQuad = slid
+                                        }
                                     }
-                                    5 -> { // Right edge bar
-                                        val allowedDx = dx.coerceIn(-minOf(q.trX, q.brX), 1f - maxOf(q.trX, q.brX))
-                                        q.copy(trX = q.trX + allowedDx, brX = q.brX + allowedDx)
-                                    }
-                                    6 -> { // Bottom edge bar
-                                        val allowedDy = dy.coerceIn(-minOf(q.blY, q.brY), 1f - maxOf(q.blY, q.brY))
-                                        q.copy(blY = q.blY + allowedDy, brY = q.brY + allowedDy)
-                                    }
-                                    7 -> { // Left edge bar
-                                        val allowedDx = dx.coerceIn(-minOf(q.tlX, q.blX), 1f - maxOf(q.tlX, q.blX))
-                                        q.copy(tlX = q.tlX + allowedDx, blX = q.blX + allowedDx)
-                                    }
-                                    else -> { // Whole-quad smooth pan
+                                    // Whole-quad smooth pan
+                                    else -> {
                                         val minX = minOf(q.tlX, q.trX, q.brX, q.blX)
                                         val maxX = maxOf(q.tlX, q.trX, q.brX, q.blX)
                                         val minY = minOf(q.tlY, q.trY, q.brY, q.blY)
                                         val maxY = maxOf(q.tlY, q.trY, q.brY, q.blY)
                                         val clDx = dx.coerceIn(-minX, 1f - maxX)
                                         val clDy = dy.coerceIn(-minY, 1f - maxY)
-                                        q.copy(
+                                        displayQuad = q.copy(
                                             tlX = q.tlX + clDx, tlY = q.tlY + clDy,
                                             trX = q.trX + clDx, trY = q.trY + clDy,
                                             brX = q.brX + clDx, brY = q.brY + clDy,
                                             blX = q.blX + clDx, blY = q.blY + clDy
                                         )
                                     }
-                                }
-                                if (DocumentEdgeDetector.isConvexForWarp(candidate)) {
-                                    displayQuad = candidate
                                 }
                             }
                         )
@@ -496,19 +621,32 @@ fun PerspectiveCropDialog(
                     CircularProgressIndicator(color = Color(0xFF38BDF8))
                 } else if (isPreviewMode) {
                     val activeBmp = if (isHoldingCompareOriginal) imageBitmap else (previewImageBitmap ?: imageBitmap)
-                    Image(
-                        bitmap = activeBmp,
-                        contentDescription = if (isHoldingCompareOriginal) "Original photo" else "Straightened scan preview",
-                        contentScale = ContentScale.Fit,
+                    Box(
                         modifier = Modifier
                             .fillMaxSize()
-                            .clip(RoundedCornerShape(10.dp))
+                            .clip(RoundedCornerShape(12.dp))
                             .border(
                                 1.5.dp,
                                 if (isHoldingCompareOriginal) Color(0xFFF59E0B) else Color(0xFF22C55E).copy(alpha = 0.7f),
-                                RoundedCornerShape(10.dp)
-                            )
-                    )
+                                RoundedCornerShape(12.dp)
+                            ),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Image(
+                            bitmap = activeBmp,
+                            contentDescription = if (isHoldingCompareOriginal) "Original photo" else "Straightened scan preview",
+                            contentScale = ContentScale.Fit,
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .graphicsLayer {
+                                    scaleX = previewZoom
+                                    scaleY = previewZoom
+                                    translationX = previewPan.x
+                                    translationY = previewPan.y
+                                }
+                        )
+                    }
+
                     if (isRenderingPreview) {
                         CircularProgressIndicator(
                             color = Color(0xFF38BDF8),
@@ -516,18 +654,76 @@ fun PerspectiveCropDialog(
                             modifier = Modifier.size(34.dp)
                         )
                     }
-                    Surface(
-                        color = Color.Black.copy(alpha = 0.72f),
-                        shape = RoundedCornerShape(999.dp),
-                        modifier = Modifier.align(Alignment.TopCenter).padding(top = 8.dp)
+
+                    // Top Preview Header Pill + Tactile Press-and-Hold Compare Button
+                    Row(
+                        modifier = Modifier
+                            .align(Alignment.TopCenter)
+                            .fillMaxWidth()
+                            .padding(horizontal = 8.dp, vertical = 8.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text(
-                            text = if (isHoldingCompareOriginal) "ORIGINAL PHOTO" else "STRAIGHTENED · ${CROP_PREVIEW_FILTERS.firstOrNull { it.first == currentFilter }?.second ?: "Magic"}",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = if (isHoldingCompareOriginal) Color(0xFFFBBF24) else Color(0xFF4ADE80),
-                            fontWeight = FontWeight.Bold,
-                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 5.dp)
-                        )
+                        Surface(
+                            color = Color.Black.copy(alpha = 0.74f),
+                            shape = RoundedCornerShape(999.dp)
+                        ) {
+                            Text(
+                                text = if (isHoldingCompareOriginal) {
+                                    "ORIGINAL PHOTO"
+                                } else {
+                                    val fName = CROP_PREVIEW_FILTERS.firstOrNull { it.first == currentFilter }?.second ?: "Magic"
+                                    val zoomSuffix = if (previewZoom > 1.05f) " · ${"%.1f".format(previewZoom)}×" else ""
+                                    "STRAIGHTENED · $fName$zoomSuffix"
+                                },
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (isHoldingCompareOriginal) Color(0xFFFBBF24) else Color(0xFF4ADE80),
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
+                            )
+                        }
+
+                        Surface(
+                            color = if (isHoldingCompareOriginal) Color(0xFFF59E0B) else Color.Black.copy(alpha = 0.74f),
+                            shape = RoundedCornerShape(999.dp),
+                            modifier = Modifier
+                                .border(
+                                    1.dp,
+                                    if (isHoldingCompareOriginal) Color(0xFFFDE68A) else Color.White.copy(alpha = 0.25f),
+                                    RoundedCornerShape(999.dp)
+                                )
+                                .clip(RoundedCornerShape(999.dp))
+                                .pointerInput(Unit) {
+                                    detectTapGestures(
+                                        onPress = {
+                                            isHoldingCompareOriginal = true
+                                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                            tryAwaitRelease()
+                                            isHoldingCompareOriginal = false
+                                        }
+                                    )
+                                }
+                                .testTag("crop_hold_compare_btn")
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                Icon(
+                                    Icons.Rounded.Compare,
+                                    contentDescription = "Hold to compare original",
+                                    tint = if (isHoldingCompareOriginal) Color.Black else Color.White,
+                                    modifier = Modifier.size(14.dp)
+                                )
+                                Text(
+                                    text = "Hold Original",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = if (isHoldingCompareOriginal) Color.Black else Color.White,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                            }
+                        }
                     }
                 } else {
                     Image(
@@ -539,10 +735,16 @@ fun PerspectiveCropDialog(
 
                     if (imageRect.width > 1f && imageRect.height > 1f) {
                         Canvas(modifier = Modifier.fillMaxSize()) {
-                            val p0 = Offset(imageRect.left + displayQuad.tlX * imageRect.width, imageRect.top + displayQuad.tlY * imageRect.height)
-                            val p1 = Offset(imageRect.left + displayQuad.trX * imageRect.width, imageRect.top + displayQuad.trY * imageRect.height)
-                            val p2 = Offset(imageRect.left + displayQuad.brX * imageRect.width, imageRect.top + displayQuad.brY * imageRect.height)
-                            val p3 = Offset(imageRect.left + displayQuad.blX * imageRect.width, imageRect.top + displayQuad.blY * imageRect.height)
+                            val p0 = Offset(imageRect.left + animTlX * imageRect.width, imageRect.top + animTlY * imageRect.height)
+                            val p1 = Offset(imageRect.left + animTrX * imageRect.width, imageRect.top + animTrY * imageRect.height)
+                            val p2 = Offset(imageRect.left + animBrX * imageRect.width, imageRect.top + animBrY * imageRect.height)
+                            val p3 = Offset(imageRect.left + animBlX * imageRect.width, imageRect.top + animBlY * imageRect.height)
+
+                            val accentColor = when {
+                                !isQuadValid -> Color(0xFFEF4444) // Crimson red invalid shape warning
+                                activeHandle >= 0 -> Color(0xFF4ADE80) // Active precision emerald
+                                else -> Color(0xFF38BDF8) // Calm cyan idle lock
+                            }
 
                             // 1. EvenOdd darkened scrim outside the selected document polygon
                             val scrimPath = Path().apply {
@@ -557,8 +759,8 @@ fun PerspectiveCropDialog(
                             drawPath(scrimPath, color = Color.Black.copy(alpha = 0.58f))
 
                             // 2. Perspective rule-of-thirds grid while actively dragging
-                            if (activeHandle >= 0) {
-                                val guideColor = Color.White.copy(alpha = 0.34f)
+                            if (activeHandle >= 0 && isQuadValid) {
+                                val guideColor = Color.White.copy(alpha = 0.36f)
                                 for (t in listOf(1f / 3f, 2f / 3f)) {
                                     val topPt = Offset(p0.x + (p1.x - p0.x) * t, p0.y + (p1.y - p0.y) * t)
                                     val botPt = Offset(p3.x + (p2.x - p3.x) * t, p3.y + (p2.y - p3.y) * t)
@@ -569,8 +771,7 @@ fun PerspectiveCropDialog(
                                 }
                             }
 
-                            // 3. Crisp Google Docs / Genius Scan border polygon with subtle outer shadow
-                            val accentColor = if (activeHandle >= 0) Color(0xFF4ADE80) else Color(0xFF38BDF8)
+                            // 3. Crisp Google Docs / Genius Scan border polygon with outer contrast shadow
                             val poly = Path().apply {
                                 moveTo(p0.x, p0.y)
                                 lineTo(p1.x, p1.y)
@@ -578,8 +779,8 @@ fun PerspectiveCropDialog(
                                 lineTo(p3.x, p3.y)
                                 close()
                             }
-                            drawPath(poly, color = Color.Black.copy(alpha = 0.45f), style = Stroke(width = 4.5.dp.toPx()))
-                            drawPath(poly, color = accentColor, style = Stroke(width = 2.4.dp.toPx()))
+                            drawPath(poly, color = Color.Black.copy(alpha = 0.50f), style = Stroke(width = 4.6.dp.toPx()))
+                            drawPath(poly, color = accentColor, style = Stroke(width = 2.5.dp.toPx()))
 
                             // 4. Google Docs Scanner–style rotated capsule edge handles along each edge slope
                             val edges = listOf(p0 to p1, p1 to p2, p2 to p3, p3 to p0)
@@ -601,7 +802,11 @@ fun PerspectiveCropDialog(
                                         cap = StrokeCap.Round
                                     )
                                     drawLine(
-                                        color = if (isEdgeActive) Color(0xFF4ADE80) else Color.White,
+                                        color = when {
+                                            !isQuadValid -> Color(0xFFFCA5A5)
+                                            isEdgeActive -> Color(0xFF4ADE80)
+                                            else -> Color.White
+                                        },
                                         start = barStart,
                                         end = barEnd,
                                         strokeWidth = (if (isEdgeActive) 5.5.dp else 4.2.dp).toPx(),
@@ -615,9 +820,8 @@ fun PerspectiveCropDialog(
                             corners.forEachIndexed { idx, pt ->
                                 val isSelected = activeHandle == idx
                                 if (isSelected) {
-                                    // Transparent target ring + fine crosshair right over the corner
                                     drawCircle(
-                                        color = Color(0xFF22C55E).copy(alpha = 0.22f),
+                                        color = accentColor.copy(alpha = 0.24f),
                                         radius = 24.dp.toPx(),
                                         center = pt
                                     )
@@ -628,8 +832,8 @@ fun PerspectiveCropDialog(
                                         style = Stroke(width = 2.6.dp.toPx())
                                     )
                                     val arm = 8.dp.toPx()
-                                    drawLine(Color(0xFF4ADE80), Offset(pt.x - arm, pt.y), Offset(pt.x + arm, pt.y), strokeWidth = 1.6.dp.toPx())
-                                    drawLine(Color(0xFF4ADE80), Offset(pt.x, pt.y - arm), Offset(pt.x, pt.y + arm), strokeWidth = 1.6.dp.toPx())
+                                    drawLine(accentColor, Offset(pt.x - arm, pt.y), Offset(pt.x + arm, pt.y), strokeWidth = 1.6.dp.toPx())
+                                    drawLine(accentColor, Offset(pt.x, pt.y - arm), Offset(pt.x, pt.y + arm), strokeWidth = 1.6.dp.toPx())
                                 } else {
                                     drawCircle(
                                         color = Color.Black.copy(alpha = 0.45f),
@@ -648,38 +852,55 @@ fun PerspectiveCropDialog(
                                         style = Stroke(width = 2.8.dp.toPx())
                                     )
                                     drawCircle(
-                                        color = Color(0xFF38BDF8),
+                                        color = accentColor,
                                         radius = 4.dp.toPx(),
                                         center = pt
                                     )
                                 }
                             }
 
-                            // 6. Signature Genius Scan / Google Docs 3.0× Magnifier Loupe
-                            //    with LIVE CONVERGING POLYGON BORDER RAYS drawn inside the zoomed circle!
+                            // 6. Pro Finger-Tracking 3.5× Optical Magnifier Loupe
+                            //    Floats directly above the dragged corner (auto-flipping cleanly when
+                            //    near the top/side screen edges so the user's thumb NEVER blocks view!)
                             if (activeHandle in 0..3) {
                                 val normPts = listOf(
-                                    displayQuad.tlX to displayQuad.tlY,
-                                    displayQuad.trX to displayQuad.trY,
-                                    displayQuad.brX to displayQuad.brY,
-                                    displayQuad.blX to displayQuad.blY
+                                    animTlX to animTlY,
+                                    animTrX to animTrY,
+                                    animBrX to animBrY,
+                                    animBlX to animBlY
                                 )
                                 val (normX, normY) = normPts[activeHandle]
                                 val prevNorm = normPts[(activeHandle + 3) % 4]
                                 val nextNorm = normPts[(activeHandle + 1) % 4]
+                                val handleScreenPt = corners[activeHandle]
 
-                                val loupeR = 62.dp.toPx()
-                                val margin = 10.dp.toPx()
-                                // Position cleanly in opposite top corner so thumb NEVER obscures magnifier
-                                val loupeCx = if (normX < 0.52f) size.width - loupeR - margin else loupeR + margin
-                                val loupeCy = loupeR + margin
+                                val loupeR = 64.dp.toPx()
+                                val edgePad = 10.dp.toPx()
+                                val liftGap = 48.dp.toPx()
+
+                                // Primary: float directly above the finger. If too close to the top edge,
+                                // shift smoothly to the opposite horizontal side of the finger!
+                                val preferredCy = handleScreenPt.y - loupeR - liftGap
+                                val (loupeCx, loupeCy) = if (preferredCy >= loupeR + edgePad) {
+                                    handleScreenPt.x.coerceIn(loupeR + edgePad, (size.width - loupeR - edgePad).coerceAtLeast(loupeR + edgePad)) to preferredCy
+                                } else {
+                                    val sideOffsetX = if (handleScreenPt.x < size.width * 0.5f) {
+                                        handleScreenPt.x + loupeR + liftGap
+                                    } else {
+                                        handleScreenPt.x - loupeR - liftGap
+                                    }
+                                    val safeX = sideOffsetX.coerceIn(loupeR + edgePad, (size.width - loupeR - edgePad).coerceAtLeast(loupeR + edgePad))
+                                    val safeY = (handleScreenPt.y + loupeR * 0.45f).coerceIn(loupeR + edgePad, (size.height - loupeR - edgePad).coerceAtLeast(loupeR + edgePad))
+                                    safeX to safeY
+                                }
+
                                 val loupeRect = Rect(loupeCx - loupeR, loupeCy - loupeR, loupeCx + loupeR, loupeCy + loupeR)
                                 val loupeClip = Path().apply { addOval(loupeRect) }
 
                                 val bmpW = imageBitmap.width
                                 val bmpH = imageBitmap.height
-                                // 3.0x optical magnification window (13% of shortest side)
-                                val sampleSpan = (minOf(bmpW, bmpH) * 0.13f).roundToInt().coerceIn(40, 240)
+                                // 3.5× optical magnification window (~10.5% of shortest side)
+                                val sampleSpan = (minOf(bmpW, bmpH) * 0.105f).roundToInt().coerceIn(36, 210)
                                 val halfSpan = sampleSpan / 2
                                 val srcCx = normX * bmpW
                                 val srcCy = normY * bmpH
@@ -688,8 +909,16 @@ fun PerspectiveCropDialog(
                                 val actualW = sampleSpan.coerceAtMost(bmpW - srcLeft).coerceAtLeast(1)
                                 val actualH = sampleSpan.coerceAtMost(bmpH - srcTop).coerceAtLeast(1)
 
+                                // Subtle pointer tether line connecting the active corner to the floating loupe
+                                drawLine(
+                                    color = accentColor.copy(alpha = 0.45f),
+                                    start = handleScreenPt,
+                                    end = Offset(loupeCx, loupeCy),
+                                    strokeWidth = 1.5.dp.toPx()
+                                )
+
                                 // Elevated shadow halo
-                                drawCircle(color = Color.Black.copy(alpha = 0.65f), radius = loupeR + 5.dp.toPx(), center = Offset(loupeCx, loupeCy))
+                                drawCircle(color = Color.Black.copy(alpha = 0.70f), radius = loupeR + 6.dp.toPx(), center = Offset(loupeCx, loupeCy))
                                 clipPath(loupeClip) {
                                     drawRect(color = Color(0xFF0A0F1C), topLeft = loupeRect.topLeft, size = loupeRect.size)
                                     drawImage(
@@ -700,7 +929,6 @@ fun PerspectiveCropDialog(
                                         dstSize = IntSize((loupeR * 2f).roundToInt(), (loupeR * 2f).roundToInt())
                                     )
 
-                                    // Project the exact corner and its two adjacent edges into loupe coordinates
                                     fun bmpToLoupe(bx: Float, by: Float): Offset {
                                         val rx = (bx - srcLeft) / actualW.toFloat()
                                         val ry = (by - srcTop) / actualH.toFloat()
@@ -711,20 +939,20 @@ fun PerspectiveCropDialog(
                                     val vPrev = bmpToLoupe(prevNorm.first * bmpW, prevNorm.second * bmpH)
                                     val vNext = bmpToLoupe(nextNorm.first * bmpW, nextNorm.second * bmpH)
 
-                                    // Draw live converging polygon border lines right inside the 3x magnifier!
-                                    drawLine(Color.Black.copy(alpha = 0.55f), vCenter, vPrev, strokeWidth = 4.dp.toPx())
-                                    drawLine(Color.Black.copy(alpha = 0.55f), vCenter, vNext, strokeWidth = 4.dp.toPx())
-                                    drawLine(Color(0xFF4ADE80), vCenter, vPrev, strokeWidth = 2.2.dp.toPx())
-                                    drawLine(Color(0xFF4ADE80), vCenter, vNext, strokeWidth = 2.2.dp.toPx())
+                                    // Live converging polygon border lines inside the 3.5× loupe
+                                    drawLine(Color.Black.copy(alpha = 0.60f), vCenter, vPrev, strokeWidth = 4.2.dp.toPx())
+                                    drawLine(Color.Black.copy(alpha = 0.60f), vCenter, vNext, strokeWidth = 4.2.dp.toPx())
+                                    drawLine(accentColor, vCenter, vPrev, strokeWidth = 2.2.dp.toPx())
+                                    drawLine(accentColor, vCenter, vNext, strokeWidth = 2.2.dp.toPx())
 
-                                    // Fine precision crosshair centered on the exact corner vertex
-                                    val arm = 16.dp.toPx()
-                                    val gap = 4.dp.toPx()
+                                    // Broken precision reticle crosshair centered on the exact corner vertex
+                                    val arm = 18.dp.toPx()
+                                    val gap = 4.5.dp.toPx()
                                     drawLine(Color.White, Offset(vCenter.x - arm, vCenter.y), Offset(vCenter.x - gap, vCenter.y), strokeWidth = 1.6.dp.toPx(), cap = StrokeCap.Round)
                                     drawLine(Color.White, Offset(vCenter.x + gap, vCenter.y), Offset(vCenter.x + arm, vCenter.y), strokeWidth = 1.6.dp.toPx(), cap = StrokeCap.Round)
                                     drawLine(Color.White, Offset(vCenter.x, vCenter.y - arm), Offset(vCenter.x, vCenter.y - gap), strokeWidth = 1.6.dp.toPx(), cap = StrokeCap.Round)
                                     drawLine(Color.White, Offset(vCenter.x, vCenter.y + gap), Offset(vCenter.x, vCenter.y + arm), strokeWidth = 1.6.dp.toPx(), cap = StrokeCap.Round)
-                                    drawCircle(Color(0xFF22C55E), radius = 3.dp.toPx(), center = vCenter)
+                                    drawCircle(accentColor, radius = 3.2.dp.toPx(), center = vCenter)
                                 }
                                 drawCircle(
                                     color = Color.White,
@@ -733,19 +961,52 @@ fun PerspectiveCropDialog(
                                     style = Stroke(width = 3.dp.toPx())
                                 )
                                 drawCircle(
-                                    color = Color(0xFF38BDF8),
+                                    color = accentColor,
                                     radius = loupeR - 2.dp.toPx(),
                                     center = Offset(loupeCx, loupeCy),
-                                    style = Stroke(width = 1.2.dp.toPx())
+                                    style = Stroke(width = 1.4.dp.toPx())
+                                )
+                            }
+                        }
+                    }
+
+                    // Live Invalid-Shape Warning Banner (Genius Scan red border companion pill)
+                    androidx.compose.animation.AnimatedVisibility(
+                        visible = !isQuadValid,
+                        enter = fadeIn(),
+                        exit = fadeOut(),
+                        modifier = Modifier.align(Alignment.TopCenter).padding(top = 10.dp)
+                    ) {
+                        Surface(
+                            color = Color(0xE67F1D1D),
+                            shape = RoundedCornerShape(999.dp),
+                            modifier = Modifier.border(1.dp, Color(0xFFEF4444), RoundedCornerShape(999.dp))
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 14.dp, vertical = 7.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                Icon(
+                                    Icons.Rounded.WarningAmber,
+                                    contentDescription = null,
+                                    tint = Color(0xFFFECACA),
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Text(
+                                    text = "Adjust corners to form a valid rectangle",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = Color.White,
+                                    fontWeight = FontWeight.SemiBold
                                 )
                             }
                         }
                     }
                 }
 
-                // Floating micro-status feedback pill (e.g., "Edges detected", "Snap ON")
+                // Floating micro-status feedback pill (e.g., "Document edges locked", "Snap ON")
                 androidx.compose.animation.AnimatedVisibility(
-                    visible = statusBadge != null,
+                    visible = statusBadge != null && isQuadValid,
                     enter = fadeIn(),
                     exit = fadeOut(),
                     modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 10.dp)
@@ -778,27 +1039,60 @@ fun PerspectiveCropDialog(
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(horizontal = 14.dp, vertical = 12.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    // Live Filter Strip inside Preview mode
+                    // Live Filter & Proportion Lock Strips inside Preview mode
                     AnimatedVisibility(visible = isPreviewMode) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-                            horizontalArrangement = Arrangement.spacedBy(6.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            CROP_PREVIEW_FILTERS.forEach { (id, label) ->
-                                FilterChip(
-                                    selected = currentFilter == id,
-                                    onClick = { currentFilter = id },
-                                    label = { Text(label, style = MaterialTheme.typography.labelMedium) },
-                                    colors = FilterChipDefaults.filterChipColors(
-                                        selectedContainerColor = Color(0xFF2563EB),
-                                        selectedLabelColor = Color.White,
-                                        containerColor = Color.White.copy(alpha = 0.08f),
-                                        labelColor = Color(0xFFCBD5E1)
+                        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                CROP_PREVIEW_FILTERS.forEach { (id, label) ->
+                                    FilterChip(
+                                        selected = currentFilter == id,
+                                        onClick = {
+                                            currentFilter = id
+                                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                        },
+                                        label = { Text(label, style = MaterialTheme.typography.labelMedium) },
+                                        colors = FilterChipDefaults.filterChipColors(
+                                            selectedContainerColor = Color(0xFF2563EB),
+                                            selectedLabelColor = Color.White,
+                                            containerColor = Color.White.copy(alpha = 0.08f),
+                                            labelColor = Color(0xFFCBD5E1)
+                                        )
                                     )
+                                }
+                            }
+                            Row(
+                                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    Icons.Rounded.AspectRatio,
+                                    contentDescription = "Output aspect ratio",
+                                    tint = Color(0xFF94A3B8),
+                                    modifier = Modifier.size(16.dp)
                                 )
+                                CropAspectPreset.entries.forEach { preset ->
+                                    FilterChip(
+                                        selected = selectedAspect == preset,
+                                        onClick = {
+                                            selectedAspect = preset
+                                            haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                        },
+                                        label = { Text(preset.label, style = MaterialTheme.typography.labelSmall) },
+                                        colors = FilterChipDefaults.filterChipColors(
+                                            selectedContainerColor = Color(0xFF0EA5E9).copy(alpha = 0.30f),
+                                            selectedLabelColor = Color(0xFF7DD3FC),
+                                            containerColor = Color.White.copy(alpha = 0.06f),
+                                            labelColor = Color(0xFF94A3B8)
+                                        )
+                                    )
+                                }
                             }
                         }
                     }
@@ -807,7 +1101,7 @@ fun PerspectiveCropDialog(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        // Auto Detect (RGB desk-color + Luma + Convex Hull)
+                        // Auto Detect (Hough 4-line + RGB Sobel + Connected-Component hybrid)
                         OutlinedButton(
                             enabled = !isDetecting && displayBitmap != null,
                             onClick = {
@@ -815,12 +1109,13 @@ fun PerspectiveCropDialog(
                                 scope.launch {
                                     isDetecting = true
                                     isPreviewMode = false
+                                    pushUndo()
                                     val detected = withContext(Dispatchers.Default) {
                                         DocumentEdgeDetector.detectFromBitmapOrNull(bmp)
                                     }
                                     if (detected != null) {
                                         displayQuad = detected
-                                        flashStatus("Document edges locked")
+                                        flashStatus("Smart 4-corner edges locked")
                                     } else {
                                         displayQuad = NormalizedQuad.FULL
                                         flashStatus("No distinct border — drag corners manually")
@@ -841,6 +1136,7 @@ fun PerspectiveCropDialog(
                         OutlinedButton(
                             onClick = {
                                 isPreviewMode = false
+                                pushUndo()
                                 displayQuad = NormalizedQuad.FULL
                                 haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                                 flashStatus("Reset to Full Frame")
@@ -857,6 +1153,7 @@ fun PerspectiveCropDialog(
                         OutlinedButton(
                             onClick = {
                                 isPreviewMode = false
+                                pushUndo()
                                 currentRotation = (currentRotation + 90) % 360
                                 displayQuad = DocumentEdgeDetector.rotateQuadCW(displayQuad, 90)
                                 haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
@@ -871,13 +1168,17 @@ fun PerspectiveCropDialog(
 
                         // Live Straightened Preview Toggle
                         Surface(
-                            color = if (isPreviewMode) Color(0xFF2563EB) else Color.White.copy(alpha = 0.14f),
+                            color = when {
+                                !isQuadValid && !isPreviewMode -> Color(0xFF334155)
+                                isPreviewMode -> Color(0xFF2563EB)
+                                else -> Color.White.copy(alpha = 0.14f)
+                            },
                             shape = RoundedCornerShape(999.dp),
                             modifier = Modifier
                                 .weight(1.15f)
                                 .height(42.dp)
                                 .clip(RoundedCornerShape(999.dp))
-                                .clickable {
+                                .clickable(enabled = isPreviewMode || isQuadValid) {
                                     isPreviewMode = !isPreviewMode
                                     haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                                 }
@@ -891,13 +1192,13 @@ fun PerspectiveCropDialog(
                                 Icon(
                                     if (isPreviewMode) Icons.Rounded.Crop else Icons.Rounded.Visibility,
                                     contentDescription = null,
-                                    tint = Color.White,
+                                    tint = if (!isQuadValid && !isPreviewMode) Color(0xFF94A3B8) else Color.White,
                                     modifier = Modifier.size(17.dp)
                                 )
                                 Spacer(Modifier.width(5.dp))
                                 Text(
                                     if (isPreviewMode) "Edit" else "Preview",
-                                    color = Color.White,
+                                    color = if (!isQuadValid && !isPreviewMode) Color(0xFF94A3B8) else Color.White,
                                     style = MaterialTheme.typography.labelLarge,
                                     fontWeight = FontWeight.SemiBold
                                 )

@@ -654,13 +654,19 @@ class OcrAndPdfEngine(private val context: Context) {
         quad: NormalizedQuad,
         filter: String,
         rotationDeg: Int,
-        maxDim: Int = 640
+        maxDim: Int = 640,
+        forcedAspectRatio: Float? = null
     ): Bitmap? = withContext(Dispatchers.Default) {
         try {
             val raw = withContext(Dispatchers.IO) { decodeSampledBitmap(uriString, (maxDim * 1.4f).toInt().coerceAtLeast(720)) }
                 ?: return@withContext null
-            val warped = if (!quad.isFullFrame()) {
-                DocumentEdgeDetector.warpPerspective(raw, quad, maxOutputDim = maxDim).also {
+            val warped = if (!quad.isFullFrame() || forcedAspectRatio != null) {
+                DocumentEdgeDetector.warpPerspective(
+                    source = raw,
+                    quad = quad,
+                    maxOutputDim = maxDim,
+                    forcedAspectRatio = forcedAspectRatio
+                ).also {
                     if (it !== raw) raw.recycle()
                 }
             } else raw
@@ -1213,6 +1219,12 @@ class OcrAndPdfEngine(private val context: Context) {
             return applyShadowRemovalBw(rotated).also { if (it !== rotated) rotated.recycle() }
         }
 
+        // True Genius Scan / Google Docs "Magic Color": morphological local illumination
+        // normalization removes hand shadows & warm desk cast while keeping stamps, logos & ink vivid
+        if (normalized == "auto" || normalized == "magic" || normalized == "color") {
+            return applyShadowRemovalColor(rotated).also { if (it !== rotated) rotated.recycle() }
+        }
+
         val filtered = Bitmap.createBitmap(rotated.width, rotated.height, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(filtered)
         val paint = Paint(Paint.ANTI_ALIAS_FLAG)
@@ -1235,24 +1247,109 @@ class OcrAndPdfEngine(private val context: Context) {
                 sat.postConcat(brightContrast)
                 paint.colorFilter = ColorMatrixColorFilter(sat)
             }
-            "auto", "magic", "color" -> {
-                // Genius Scan Magic Color: clean bright paper + crisp ink contrast
-                val sat = ColorMatrix().apply { setSaturation(1.16f) }
-                val contrast = ColorMatrix(
-                    floatArrayOf(
-                        1.32f, 0f, 0f, 0f, -24f,
-                        0f, 1.32f, 0f, 0f, -24f,
-                        0f, 0f, 1.32f, 0f, -24f,
-                        0f, 0f, 0f, 1f, 0f
-                    )
-                )
-                sat.postConcat(contrast)
-                paint.colorFilter = ColorMatrixColorFilter(sat)
-            }
         }
         canvas.drawBitmap(rotated, 0f, 0f, paint)
         rotated.recycle()
         return filtered
+    }
+
+    /**
+     * Pro-grade shadow-free Magic Color enhancement:
+     * 1. Estimates the smooth local paper illumination surface using a 36px downsampled grid
+     *    with a 3×3 morphological max-dilation pass so dark printed headers, tables, or photos
+     *    never corrupt the estimated paper background (preventing bright halos).
+     * 2. Divides out per-channel R/G/B lighting cast (eliminating hand shadows & yellow tungsten tint).
+     * 3. Snaps neutral near-paper highlights cleanly to crisp white while preserving and gently
+     *    boosting colored logos, blue pen ink, highlighter marks, and official stamps.
+     */
+    private fun applyShadowRemovalColor(src: Bitmap): Bitmap {
+        val w = src.width
+        val h = src.height
+        val bgW = 36
+        val bgH = ((h.toFloat() / w.coerceAtLeast(1)) * bgW).toInt().coerceIn(24, 64)
+        val tinyBg = Bitmap.createScaledBitmap(src, bgW, bgH, true)
+
+        // 3×3 morphological dilation on the 36px grid estimates pure paper illumination over dark ink
+        val tinyPix = IntArray(bgW * bgH)
+        tinyBg.getPixels(tinyPix, 0, bgW, 0, 0, bgW, bgH)
+        val dilatedPix = IntArray(bgW * bgH)
+        for (y in 0 until bgH) {
+            val y0 = (y - 1).coerceAtLeast(0)
+            val y1 = (y + 1).coerceAtMost(bgH - 1)
+            for (x in 0 until bgW) {
+                val x0 = (x - 1).coerceAtLeast(0)
+                val x1 = (x + 1).coerceAtMost(bgW - 1)
+                var maxR = 0
+                var maxG = 0
+                var maxB = 0
+                for (ny in y0..y1) {
+                    val rowOff = ny * bgW
+                    for (nx in x0..x1) {
+                        val p = tinyPix[rowOff + nx]
+                        val pr = (p ushr 16) and 0xFF
+                        val pg = (p ushr 8) and 0xFF
+                        val pb = p and 0xFF
+                        if (pr > maxR) maxR = pr
+                        if (pg > maxG) maxG = pg
+                        if (pb > maxB) maxB = pb
+                    }
+                }
+                dilatedPix[y * bgW + x] = (0xFF shl 24) or (maxR shl 16) or (maxG shl 8) or maxB
+            }
+        }
+        val dilatedBg = Bitmap.createBitmap(dilatedPix, bgW, bgH, Bitmap.Config.ARGB_8888)
+        tinyBg.recycle()
+        val smoothBg = Bitmap.createScaledBitmap(dilatedBg, w, h, true)
+        dilatedBg.recycle()
+
+        val srcPixels = IntArray(w * h)
+        val bgPixels = IntArray(w * h)
+        src.getPixels(srcPixels, 0, w, 0, 0, w, h)
+        smoothBg.getPixels(bgPixels, 0, w, 0, 0, w, h)
+        smoothBg.recycle()
+
+        val outPixels = IntArray(w * h)
+        for (i in srcPixels.indices) {
+            val sp = srcPixels[i]
+            val bp = bgPixels[i]
+            val sr = (sp ushr 16) and 0xFF
+            val sg = (sp ushr 8) and 0xFF
+            val sb = sp and 0xFF
+
+            val br = ((bp ushr 16) and 0xFF).coerceAtLeast(56)
+            val bg = ((bp ushr 8) and 0xFF).coerceAtLeast(56)
+            val bb = (bp and 0xFF).coerceAtLeast(56)
+
+            // Per-channel illumination division removes warm lighting & directional shadows
+            var nr = ((sr * 252) / br).coerceAtMost(255)
+            var ng = ((sg * 252) / bg).coerceAtMost(255)
+            var nb = ((sb * 252) / bb).coerceAtMost(255)
+
+            val minC = minOf(nr, ng, nb)
+            val maxC = maxOf(nr, ng, nb)
+            val chroma = maxC - minC
+
+            if (minC >= 216 && chroma <= 32) {
+                // Paper highlight rolloff -> clean crisp document white
+                val t = ((minC - 216) * 255) / 39
+                nr = (nr + ((255 - nr) * t) / 255).coerceIn(0, 255)
+                ng = (ng + ((255 - ng) * t) / 255).coerceIn(0, 255)
+                nb = (nb + ((255 - nb) * t) / 255).coerceIn(0, 255)
+            } else {
+                // Crisp ink contrast + gentle 1.16x color vibrancy for logos, stamps & colored pen
+                nr = (((nr - 128) * 116) / 100 + 124).coerceIn(0, 255)
+                ng = (((ng - 128) * 116) / 100 + 124).coerceIn(0, 255)
+                nb = (((nb - 128) * 116) / 100 + 124).coerceIn(0, 255)
+                if (chroma > 18) {
+                    val luma = (nr * 299 + ng * 587 + nb * 114) / 1000
+                    nr = (luma + ((nr - luma) * 118) / 100).coerceIn(0, 255)
+                    ng = (luma + ((ng - luma) * 118) / 100).coerceIn(0, 255)
+                    nb = (luma + ((nb - luma) * 118) / 100).coerceIn(0, 255)
+                }
+            }
+            outPixels[i] = (0xFF shl 24) or (nr shl 16) or (ng shl 8) or nb
+        }
+        return Bitmap.createBitmap(outPixels, w, h, Bitmap.Config.ARGB_8888)
     }
 
     /**
