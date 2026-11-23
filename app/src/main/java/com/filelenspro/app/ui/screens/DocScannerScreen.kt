@@ -3,6 +3,7 @@ package com.filelenspro.app.ui.screens
 import android.Manifest
 import android.app.Activity
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.net.Uri
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -10,6 +11,7 @@ import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -67,6 +69,8 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -81,6 +85,7 @@ import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.graphics.ColorMatrix
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
@@ -205,6 +210,9 @@ fun DocScannerScreen(
                         if (idx == targetIdx && cur.uri == pageItem.uri) cur.copy(quad = detected) else cur
                     }
                 }
+                if (scanMode == "single" && scannedPages.isNotEmpty()) {
+                    cropEditingIndex = 0
+                }
             }
         }
     }
@@ -260,16 +268,29 @@ fun DocScannerScreen(
                     filter = activeGlobalFilter,
                     quad = detectedQuad
                 )
+                val targetIdx = if (scanMode == "single") 0 else scannedPages.size
                 scannedPages = if (scanMode == "single") {
                     listOf(newItem)
                 } else {
                     scannedPages + newItem
                 }
+                // Refine edges with full RGB desk-color detection if live luma returned full frame
+                if (detectedQuad.isFullFrame()) {
+                    scope.launch {
+                        val refined = toolsViewModel.engine.detectDocumentQuadForUri(uri.toString())
+                        if (!refined.isFullFrame()) {
+                            scannedPages = scannedPages.mapIndexed { idx, cur ->
+                                if (idx == targetIdx && cur.uri == uri && cur.quad.isFullFrame()) cur.copy(quad = refined) else cur
+                            }
+                        }
+                    }
+                }
                 if (scanMode == "single") {
                     showLiveCamera = false
+                    cropEditingIndex = 0
                 } else if (scanMode == "idcard" && scannedPages.size >= 2) {
                     showLiveCamera = false
-                    toolsViewModel.postToast("Front & Back captured — ready to export 2-in-1 A4 ID!")
+                    toolsViewModel.postToast("Front & Back captured — tap either card to fine-tune corners!")
                 }
             },
             onOpenGallery = {
@@ -300,13 +321,17 @@ fun DocScannerScreen(
             imageUri = editing.uri,
             pageLabel = if (scanMode == "idcard") (if (cropEditingIndex == 0) "Front" else "Back") else "Page ${cropEditingIndex + 1}",
             initialQuad = editing.quad,
+            initialRotationDeg = editing.rotationDeg,
+            initialFilter = editing.filter,
             engine = toolsViewModel.engine,
             onDismiss = { cropEditingIndex = -1 },
-            onApply = { updatedQuad ->
+            onApply = { updatedQuad, updatedRot, updatedFilter ->
                 val idx = cropEditingIndex
-                scannedPages = scannedPages.mapIndexed { i, p -> if (i == idx) p.copy(quad = updatedQuad) else p }
+                scannedPages = scannedPages.mapIndexed { i, p ->
+                    if (i == idx) p.copy(quad = updatedQuad, rotationDeg = updatedRot, filter = updatedFilter) else p
+                }
                 cropEditingIndex = -1
-                toolsViewModel.postToast("Perspective crop saved")
+                toolsViewModel.postToast("Perspective straightening applied")
             }
         )
     }
@@ -696,17 +721,16 @@ fun DocScannerScreen(
                                         .background(Color.Black.copy(alpha = 0.08f))
                                         .clickable { cropEditingIndex = idx }
                                 ) {
-                                    AsyncImage(
-                                        model = item.uri,
+                                    ScannedPagePreviewImage(
+                                        item = item,
+                                        previewFilter = previewFilter,
+                                        engine = toolsViewModel.engine,
                                         contentDescription = "Scanned page ${idx + 1}",
-                                        contentScale = ContentScale.Fit,
-                                        colorFilter = previewFilter,
                                         modifier = Modifier
                                             .fillMaxSize()
                                             .padding(6.dp)
-                                            .rotate(item.rotationDeg.toFloat())
                                     )
-                                    // Top-left Page / Front-Back Badge + Cropped pill
+                                    // Top-left Page / Front-Back Badge + Straightened pill
                                     Row(
                                         modifier = Modifier.align(Alignment.TopStart).padding(6.dp),
                                         horizontalArrangement = Arrangement.spacedBy(4.dp)
@@ -725,11 +749,11 @@ fun DocScannerScreen(
                                         }
                                         if (hasCustomCrop) {
                                             Surface(
-                                                color = palette.success.copy(alpha = 0.9f),
+                                                color = palette.success.copy(alpha = 0.92f),
                                                 shape = RoundedCornerShape(6.dp)
                                             ) {
                                                 Text(
-                                                    "Cropped",
+                                                    "Straightened",
                                                     color = Color.White,
                                                     style = MaterialTheme.typography.labelSmall,
                                                     fontWeight = FontWeight.SemiBold,
@@ -948,5 +972,60 @@ private fun colorFilterForScanMode(filter: String): ColorFilter? {
             ColorFilter.colorMatrix(sat)
         }
         else -> null
+    }
+}
+
+/**
+ * Renders the true Matrix.setPolyToPoly perspective-warped, filtered, and rotated thumbnail
+ * for each scanned page in the Review Studio (falling back instantaneously to AsyncImage
+ * during the ~20ms background render).
+ */
+@Composable
+private fun ScannedPagePreviewImage(
+    item: ScannedPageItem,
+    previewFilter: ColorFilter?,
+    engine: com.filelenspro.app.service.OcrAndPdfEngine,
+    contentDescription: String,
+    modifier: Modifier = Modifier
+) {
+    var warpedBitmap by remember(item.uri) { mutableStateOf<Bitmap?>(null) }
+
+    LaunchedEffect(item.uri, item.quad, item.filter, item.rotationDeg) {
+        val rendered = engine.renderPagePreviewBitmap(
+            uriString = item.uri.toString(),
+            quad = item.quad,
+            filter = item.filter,
+            rotationDeg = item.rotationDeg,
+            maxDim = 560
+        )
+        val old = warpedBitmap
+        warpedBitmap = rendered
+        if (old != null && old !== rendered && !old.isRecycled) {
+            old.recycle()
+        }
+    }
+
+    DisposableEffect(item.uri) {
+        onDispose {
+            warpedBitmap?.takeIf { !it.isRecycled }?.recycle()
+        }
+    }
+
+    val bmp = warpedBitmap?.takeIf { !it.isRecycled }
+    if (bmp != null) {
+        Image(
+            bitmap = bmp.asImageBitmap(),
+            contentDescription = contentDescription,
+            contentScale = ContentScale.Fit,
+            modifier = modifier
+        )
+    } else {
+        AsyncImage(
+            model = item.uri,
+            contentDescription = contentDescription,
+            contentScale = ContentScale.Fit,
+            colorFilter = previewFilter,
+            modifier = modifier.rotate(item.rotationDeg.toFloat())
+        )
     }
 }

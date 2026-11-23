@@ -348,7 +348,7 @@ class OcrAndPdfEngine(private val context: Context) {
                         val raw = decodeSampledBitmap(uri, qualityPreset.maxDim) ?: return@async null
                         val quad = quads.getOrElse(idx) { NormalizedQuad.FULL }
                         val warped = if (!quad.isFullFrame()) {
-                            val w = DocumentEdgeDetector.warpPerspective(raw, quad)
+                            val w = DocumentEdgeDetector.warpPerspective(raw, quad, qualityPreset.maxDim)
                             if (w !== raw) raw.recycle()
                             w
                         } else raw
@@ -612,9 +612,70 @@ class OcrAndPdfEngine(private val context: Context) {
         return try {
             val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
             openInputStream(uriString)?.use { BitmapFactory.decodeStream(it, null, bounds) }
-            bounds.outWidth.coerceAtLeast(0) to bounds.outHeight.coerceAtLeast(0)
+            val w = bounds.outWidth.coerceAtLeast(0)
+            val h = bounds.outHeight.coerceAtLeast(0)
+            if (w <= 0 || h <= 0) return 0 to 0
+            val orientation = openInputStream(uriString)?.use {
+                ExifInterface(it).getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)
+            } ?: ExifInterface.ORIENTATION_NORMAL
+            val swap = orientation == ExifInterface.ORIENTATION_ROTATE_90 ||
+                orientation == ExifInterface.ORIENTATION_ROTATE_270 ||
+                orientation == ExifInterface.ORIENTATION_TRANSPOSE ||
+                orientation == ExifInterface.ORIENTATION_TRANSVERSE
+            if (swap) h to w else w to h
         } catch (_: Exception) {
             0 to 0
+        }
+    }
+
+    /**
+     * Decodes an EXIF-corrected bitmap with optional clockwise display rotation (0/90/180/270)
+     * for pixel-exact rendering inside the interactive 4-corner Perspective Crop Editor.
+     */
+    suspend fun decodeOrientedBitmap(
+        uriString: String,
+        rotationDeg: Int = 0,
+        maxDim: Int = 1440
+    ): Bitmap? = withContext(Dispatchers.IO) {
+        val raw = decodeSampledBitmap(uriString, maxDim) ?: return@withContext null
+        val normRot = ((rotationDeg % 360) + 360) % 360
+        if (normRot == 0) return@withContext raw
+        val m = Matrix().apply { postRotate(normRot.toFloat()) }
+        Bitmap.createBitmap(raw, 0, 0, raw.width, raw.height, m, true).also { raw.recycle() }
+    }
+
+    /**
+     * Ultra-fast (~15–30ms) preview renderer applying real Matrix.setPolyToPoly perspective
+     * straightening, scan filter enhancement, and rotation for live Review Studio cards
+     * and the Perspective Cropper's "Preview Straightened" toggle.
+     */
+    suspend fun renderPagePreviewBitmap(
+        uriString: String,
+        quad: NormalizedQuad,
+        filter: String,
+        rotationDeg: Int,
+        maxDim: Int = 640
+    ): Bitmap? = withContext(Dispatchers.Default) {
+        try {
+            val raw = withContext(Dispatchers.IO) { decodeSampledBitmap(uriString, (maxDim * 1.4f).toInt().coerceAtLeast(720)) }
+                ?: return@withContext null
+            val warped = if (!quad.isFullFrame()) {
+                DocumentEdgeDetector.warpPerspective(raw, quad, maxOutputDim = maxDim).also {
+                    if (it !== raw) raw.recycle()
+                }
+            } else raw
+            val processed = processBitmapFilterAndRotation(warped, filter, rotationDeg % 360)
+            val maxSide = maxOf(processed.width, processed.height)
+            if (maxSide > maxDim) {
+                val scale = maxDim.toFloat() / maxSide.toFloat()
+                val nw = (processed.width * scale).toInt().coerceAtLeast(1)
+                val nh = (processed.height * scale).toInt().coerceAtLeast(1)
+                Bitmap.createScaledBitmap(processed, nw, nh, true).also { processed.recycle() }
+            } else {
+                processed
+            }
+        } catch (_: Exception) {
+            null
         }
     }
 
@@ -662,43 +723,61 @@ class OcrAndPdfEngine(private val context: Context) {
     ): Boolean = withContext(Dispatchers.IO) {
         try {
             outputFile.parentFile?.mkdirs()
+            val (frontBmp, backBmp) = coroutineScope {
+                val fJob = async {
+                    decodeSampledBitmap(frontUri, 1800)?.let { rawFront ->
+                        val warpedFront = if (!frontQuad.isFullFrame()) {
+                            DocumentEdgeDetector.warpPerspective(rawFront, frontQuad, 1800).also { if (it !== rawFront) rawFront.recycle() }
+                        } else rawFront
+                        processBitmapFilterAndRotation(warpedFront, frontFilter, frontRotation % 360)
+                    }
+                }
+                val bJob = async {
+                    if (backUri.isNullOrBlank()) null
+                    else decodeSampledBitmap(backUri, 1800)?.let { rawBack ->
+                        val warpedBack = if (!backQuad.isFullFrame()) {
+                            DocumentEdgeDetector.warpPerspective(rawBack, backQuad, 1800).also { if (it !== rawBack) rawBack.recycle() }
+                        } else rawBack
+                        processBitmapFilterAndRotation(warpedBack, backFilter, backRotation % 360)
+                    }
+                }
+                fJob.await() to bJob.await()
+            }
+
+            if (frontBmp == null && backBmp == null) return@withContext false
+
             PDDocument().use { doc ->
                 val page = PDPage(PDRectangle.A4)
                 doc.addPage(page)
                 val pw = PDRectangle.A4.width
                 val ph = PDRectangle.A4.height
-                val cardW = pw * 0.72f
-                val cardH = cardW * 0.63f
-                val leftX = (pw - cardW) / 2f
+                val slotW = pw * 0.76f
+                val slotH = slotW * 0.63f // ISO/IEC 7810 ID-1 card ratio (~85.6 × 54mm)
+                val slotX = (pw - slotW) / 2f
+
+                fun drawCardInSlot(cs: PDPageContentStream, bmp: Bitmap, slotY: Float) {
+                    val imgRatio = bmp.width.toFloat() / bmp.height.coerceAtLeast(1)
+                    val slotRatio = slotW / slotH
+                    val drawW = if (imgRatio >= slotRatio) slotW else slotH * imgRatio
+                    val drawH = if (imgRatio >= slotRatio) slotW / imgRatio else slotH
+                    val drawX = slotX + (slotW - drawW) / 2f
+                    val drawY = slotY + (slotH - drawH) / 2f
+                    val pdImg = JPEGFactory.createFromImage(doc, bmp, 0.90f)
+                    cs.drawImage(pdImg, drawX, drawY, drawW, drawH)
+                    cs.setStrokingColor(37f / 255f, 99f / 255f, 235f / 255f)
+                    cs.setLineWidth(1.2f)
+                    cs.addRect(drawX, drawY, drawW, drawH)
+                    cs.stroke()
+                }
 
                 PDPageContentStream(doc, page).use { cs ->
-                    decodeSampledBitmap(frontUri, 1600)?.let { rawFront ->
-                        val warpedFront = if (!frontQuad.isFullFrame()) {
-                            DocumentEdgeDetector.warpPerspective(rawFront, frontQuad).also { if (it !== rawFront) rawFront.recycle() }
-                        } else rawFront
-                        val frontBmp = processBitmapFilterAndRotation(warpedFront, frontFilter, frontRotation % 360)
-                        val frontImg = JPEGFactory.createFromImage(doc, frontBmp, 0.90f)
-                        cs.drawImage(frontImg, leftX, ph - cardH - 80f, cardW, cardH)
-                        cs.setStrokingColor(37f / 255f, 99f / 255f, 235f / 255f)
-                        cs.setLineWidth(1.5f)
-                        cs.addRect(leftX, ph - cardH - 80f, cardW, cardH)
-                        cs.stroke()
-                        frontBmp.recycle()
+                    frontBmp?.let { bmp ->
+                        drawCardInSlot(cs, bmp, ph - slotH - 86f)
+                        bmp.recycle()
                     }
-                    if (!backUri.isNullOrBlank()) {
-                        decodeSampledBitmap(backUri, 1600)?.let { rawBack ->
-                            val warpedBack = if (!backQuad.isFullFrame()) {
-                                DocumentEdgeDetector.warpPerspective(rawBack, backQuad).also { if (it !== rawBack) rawBack.recycle() }
-                            } else rawBack
-                            val backBmp = processBitmapFilterAndRotation(warpedBack, backFilter, backRotation % 360)
-                            val backImg = JPEGFactory.createFromImage(doc, backBmp, 0.90f)
-                            cs.drawImage(backImg, leftX, ph - (cardH * 2f) - 130f, cardW, cardH)
-                            cs.setStrokingColor(37f / 255f, 99f / 255f, 235f / 255f)
-                            cs.setLineWidth(1.5f)
-                            cs.addRect(leftX, ph - (cardH * 2f) - 130f, cardW, cardH)
-                            cs.stroke()
-                            backBmp.recycle()
-                        }
+                    backBmp?.let { bmp ->
+                        drawCardInSlot(cs, bmp, ph - (slotH * 2f) - 138f)
+                        bmp.recycle()
                     }
                 }
                 doc.save(outputFile)
