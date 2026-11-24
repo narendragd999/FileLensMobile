@@ -77,6 +77,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.filelenspro.app.ui.components.AllFilesPermissionDialog
 import com.filelenspro.app.ui.components.BiometricAuthHelper
@@ -585,17 +586,22 @@ fun SettingsScreen(
                                         }
                                     }
                                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                        Button(onClick = { toolsViewModel.rerunAllPendingOcr() }, modifier = Modifier.weight(1f)) {
-                                            Text("Run Pending OCR")
+                                        Button(
+                                            onClick = { toolsViewModel.rerunAllPendingOcr() },
+                                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 10.dp),
+                                            modifier = Modifier.weight(1f)
+                                        ) {
+                                            Text("Run OCR", maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis)
                                         }
                                         OutlinedButton(
                                             onClick = { toolsViewModel.clearSearchIndex() },
                                             colors = ButtonDefaults.outlinedButtonColors(contentColor = palette.danger),
+                                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 10.dp),
                                             modifier = Modifier.weight(1f)
                                         ) {
                                             Icon(Icons.Rounded.DeleteForever, contentDescription = null, modifier = Modifier.size(16.dp))
                                             Spacer(Modifier.width(4.dp))
-                                            Text("Clear Index")
+                                            Text("Clear Index", maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis)
                                         }
                                     }
                                 }
@@ -655,15 +661,23 @@ fun SettingsScreen(
                                     Text("FileSearchPro v2.0.0 (Native Kotlin)", style = MaterialTheme.typography.titleLarge, color = palette.text, fontWeight = FontWeight.Bold)
                                     Text("On-Device Document Intelligence · Incremental Full-Device Indexer · Second Brain · Smart Cards · PDF Tools · LAN Explorer", style = MaterialTheme.typography.bodyMedium, color = palette.muted)
                                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                        Button(onClick = { showTutorial = true }, modifier = Modifier.weight(1f)) {
+                                        Button(
+                                            onClick = { showTutorial = true },
+                                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 10.dp),
+                                            modifier = Modifier.weight(1f)
+                                        ) {
                                             Icon(Icons.AutoMirrored.Rounded.HelpOutline, contentDescription = null, modifier = Modifier.size(16.dp))
-                                            Spacer(Modifier.width(6.dp))
-                                            Text("Interactive Guide")
+                                            Spacer(Modifier.width(5.dp))
+                                            Text("User Guide", maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis)
                                         }
-                                        OutlinedButton(onClick = { showPrivacy = true }, modifier = Modifier.weight(1f)) {
+                                        OutlinedButton(
+                                            onClick = { showPrivacy = true },
+                                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 10.dp),
+                                            modifier = Modifier.weight(1f)
+                                        ) {
                                             Icon(Icons.Rounded.Shield, contentDescription = null, modifier = Modifier.size(16.dp))
-                                            Spacer(Modifier.width(6.dp))
-                                            Text("Privacy Policy")
+                                            Spacer(Modifier.width(5.dp))
+                                            Text("Privacy", maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis)
                                         }
                                     }
                                 }

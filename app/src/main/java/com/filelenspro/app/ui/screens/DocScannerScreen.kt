@@ -274,23 +274,37 @@ fun DocScannerScreen(
                 } else {
                     scannedPages + newItem
                 }
-                // Refine edges with full RGB desk-color detection if live luma returned full frame
-                if (detectedQuad.isFullFrame()) {
-                    scope.launch {
-                        val refined = toolsViewModel.engine.detectDocumentQuadForUri(uri.toString())
-                        if (!refined.isFullFrame()) {
-                            scannedPages = scannedPages.mapIndexed { idx, cur ->
-                                if (idx == targetIdx && cur.uri == uri && cur.quad.isFullFrame()) cur.copy(quad = refined) else cur
+                if (scanMode == "single") {
+                    showLiveCamera = false
+                    if (detectedQuad.isFullFrame()) {
+                        // Refine edges BEFORE opening Crop Dialog so corners never jump mid-edit!
+                        scope.launch {
+                            val refined = toolsViewModel.engine.detectDocumentQuadForUri(uri.toString())
+                            if (!refined.isFullFrame()) {
+                                scannedPages = scannedPages.mapIndexed { idx, cur ->
+                                    if (idx == 0 && cur.uri == uri) cur.copy(quad = refined) else cur
+                                }
+                            }
+                            cropEditingIndex = 0
+                        }
+                    } else {
+                        cropEditingIndex = 0
+                    }
+                } else {
+                    if (detectedQuad.isFullFrame()) {
+                        scope.launch {
+                            val refined = toolsViewModel.engine.detectDocumentQuadForUri(uri.toString())
+                            if (!refined.isFullFrame()) {
+                                scannedPages = scannedPages.mapIndexed { idx, cur ->
+                                    if (idx == targetIdx && cur.uri == uri && cur.quad.isFullFrame()) cur.copy(quad = refined) else cur
+                                }
                             }
                         }
                     }
-                }
-                if (scanMode == "single") {
-                    showLiveCamera = false
-                    cropEditingIndex = 0
-                } else if (scanMode == "idcard" && scannedPages.size >= 2) {
-                    showLiveCamera = false
-                    toolsViewModel.postToast("Front & Back captured — tap either card to fine-tune corners!")
+                    if (scanMode == "idcard" && scannedPages.size >= 2) {
+                        showLiveCamera = false
+                        toolsViewModel.postToast("Front & Back captured — tap either card to straighten!")
+                    }
                 }
             },
             onOpenGallery = {
@@ -366,12 +380,17 @@ fun DocScannerScreen(
                 }
                 FilledTonalButton(
                     onClick = { openInstantLiveScanner() },
-                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
                     modifier = Modifier.testTag("scanner_open_live_btn")
                 ) {
                     Icon(Icons.Rounded.CameraAlt, contentDescription = null, modifier = Modifier.size(16.dp))
-                    Spacer(Modifier.width(4.dp))
-                    Text(if (scannedPages.isEmpty()) "Live Scan" else "+ Scan", style = MaterialTheme.typography.labelLarge)
+                    Spacer(Modifier.width(5.dp))
+                    Text(
+                        text = if (scannedPages.isEmpty()) "Live Scan" else "+ Scan",
+                        style = MaterialTheme.typography.labelLarge,
+                        maxLines = 1,
+                        softWrap = false
+                    )
                 }
             }
         }
@@ -445,7 +464,11 @@ fun DocScannerScreen(
                     ) {
                         Icon(Icons.Rounded.AutoAwesome, contentDescription = "Smart Auto-Name", modifier = Modifier.size(18.dp))
                         Spacer(Modifier.width(4.dp))
-                        Text(if (isSmartNaming) "…" else "Smart")
+                        Text(
+                            text = if (isSmartNaming) "…" else "Smart",
+                            maxLines = 1,
+                            softWrap = false
+                        )
                     }
                 }
 
@@ -612,34 +635,61 @@ fun DocScannerScreen(
                 }
             }
 
-            // Capture Controls Row
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+            // Rich Zero-Wrap Capture Action Deck
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
                 Button(
                     onClick = { openInstantLiveScanner() },
-                    colors = ButtonDefaults.buttonColors(containerColor = palette.accent),
-                    modifier = Modifier.weight(1.3f).testTag("scanner_direct_camera_btn")
+                    colors = ButtonDefaults.buttonColors(containerColor = palette.accent, contentColor = Color.White),
+                    shape = RoundedCornerShape(14.dp),
+                    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 13.dp),
+                    modifier = Modifier.fillMaxWidth().height(48.dp).testTag("scanner_direct_camera_btn")
                 ) {
-                    Icon(Icons.Rounded.CameraAlt, contentDescription = null, modifier = Modifier.size(18.dp))
-                    Spacer(Modifier.width(5.dp))
-                    Text("Live Scan")
+                    Icon(Icons.Rounded.CameraAlt, contentDescription = null, modifier = Modifier.size(19.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        text = if (scannedPages.isEmpty()) "Open Live Document Scanner" else "Scan More Pages",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 1,
+                        softWrap = false,
+                        overflow = TextOverflow.Ellipsis
+                    )
                 }
-                OutlinedButton(
-                    onClick = {
-                        galleryFallbackLauncher.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
-                    },
-                    modifier = Modifier.weight(1f).testTag("scanner_pick_photos_btn")
-                ) {
-                    Icon(Icons.Rounded.PhotoLibrary, contentDescription = null, modifier = Modifier.size(18.dp))
-                    Spacer(Modifier.width(4.dp))
-                    Text("Photos")
-                }
-                OutlinedButton(
-                    onClick = { launchMlKitScanner() },
-                    modifier = Modifier.weight(0.95f).testTag("scanner_launch_mlkit_btn")
-                ) {
-                    Icon(Icons.Rounded.DocumentScanner, contentDescription = null, modifier = Modifier.size(18.dp))
-                    Spacer(Modifier.width(4.dp))
-                    Text("AI Scan")
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                    OutlinedButton(
+                        onClick = {
+                            galleryFallbackLauncher.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+                        },
+                        shape = RoundedCornerShape(12.dp),
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 10.dp),
+                        modifier = Modifier.weight(1f).height(44.dp).testTag("scanner_pick_photos_btn")
+                    ) {
+                        Icon(Icons.Rounded.PhotoLibrary, contentDescription = null, modifier = Modifier.size(17.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            text = "Import Photos",
+                            style = MaterialTheme.typography.labelLarge,
+                            maxLines = 1,
+                            softWrap = false,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    OutlinedButton(
+                        onClick = { launchMlKitScanner() },
+                        shape = RoundedCornerShape(12.dp),
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 10.dp),
+                        modifier = Modifier.weight(1f).height(44.dp).testTag("scanner_launch_mlkit_btn")
+                    ) {
+                        Icon(Icons.Rounded.DocumentScanner, contentDescription = null, modifier = Modifier.size(17.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            text = "Google AI Scan",
+                            style = MaterialTheme.typography.labelLarge,
+                            maxLines = 1,
+                            softWrap = false,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
                 }
             }
 
@@ -918,10 +968,13 @@ fun DocScannerScreen(
                         when {
                             isSavingPdf -> "Straightening & Building PDF…"
                             isAppendMode -> "Append ${scannedPages.size} Page(s) to PDF"
-                            scanMode == "idcard" -> "Save 2-in-1 A4 ID PDF & Index"
-                            else -> "Build ${scannedPages.size}-Page PDF & Auto-Index"
+                            scanMode == "idcard" -> "Save 2-in-1 A4 ID PDF"
+                            else -> "Build ${scannedPages.size}-Page PDF & Index"
                         },
-                        fontWeight = FontWeight.SemiBold
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        softWrap = false,
+                        overflow = TextOverflow.Ellipsis
                     )
                 }
             }

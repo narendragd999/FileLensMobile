@@ -343,6 +343,24 @@ class DocumentEdgeDetectorTest {
     }
 
     @Test
+    fun squareUpQuadToRectangle_levelsSkewedTrapezoidIntoExact90DegreeRect() {
+        val skewed = NormalizedQuad(
+            tlX = 0.22f, tlY = 0.16f,
+            trX = 0.78f, trY = 0.20f,
+            brX = 0.86f, brY = 0.82f,
+            blX = 0.14f, blY = 0.86f
+        )
+        val rect = DocumentEdgeDetector.squareUpQuadToRectangle(skewed)
+        assertEquals(rect.tlX, rect.blX, 0.0001f)
+        assertEquals(rect.trX, rect.brX, 0.0001f)
+        assertEquals(rect.tlY, rect.trY, 0.0001f)
+        assertEquals(rect.blY, rect.brY, 0.0001f)
+        assertTrue(rect.trX > rect.tlX + 0.4f)
+        assertTrue(rect.blY > rect.tlY + 0.4f)
+        assertTrue(DocumentEdgeDetector.isConvexForWarp(rect))
+    }
+
+    @Test
     fun photoCompressPresets_areOrderedByQualityAndSavings() {
         assertTrue(PhotoCompressPreset.MAX_QUALITY.quality > PhotoCompressPreset.LOSSLESS_LOOK.quality)
         assertTrue(PhotoCompressPreset.LOSSLESS_LOOK.quality > PhotoCompressPreset.ULTRA_COMPACT.quality)

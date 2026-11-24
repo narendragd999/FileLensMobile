@@ -527,17 +527,76 @@ object DocumentEdgeDetector {
         var best: NormalizedQuad? = null
         var bestScore = -1f
         for (cand in candidates) {
-            if (!isConvexAndValid(cand)) continue
+            if (!isConvexAndValid(cand) || !hasReasonableCornerAngles(cand)) continue
             val area = computeQuadArea(cand)
-            if (area < 0.12f || area > 0.96f) continue
+            if (area < 0.14f || area > 0.96f) continue
             val perim = scoreQuadPerimeter(cand, grad, width, height)
-            val total = perim + cand.confidence * 0.18f
+            val rectBonus = scoreRectangularity(cand) * 0.22f
+            val total = perim + rectBonus + cand.confidence * 0.16f
             if (total > bestScore) {
                 bestScore = total
                 best = cand.copy(confidence = (0.52f + perim * 0.44f).coerceIn(0.48f, 0.99f))
             }
         }
         return best
+    }
+
+    /**
+     * Evaluates how close a 4-corner quadrilateral is to a clean document rectangle (0..1):
+     * rewards corner angles near 90° and reasonably balanced opposite edge lengths so
+     * rectangular paper sheets cleanly outscore irregular/twisted desk artifacts.
+     */
+    private fun scoreRectangularity(q: NormalizedQuad): Float {
+        val pts = arrayOf(
+            q.tlX to q.tlY,
+            q.trX to q.trY,
+            q.brX to q.brY,
+            q.blX to q.blY
+        )
+        var angleDeviationSum = 0.0
+        for (i in 0 until 4) {
+            val prev = pts[(i + 3) % 4]
+            val cur = pts[i]
+            val next = pts[(i + 1) % 4]
+            val v1x = prev.first - cur.first; val v1y = prev.second - cur.second
+            val v2x = next.first - cur.first; val v2y = next.second - cur.second
+            val d1 = hypot(v1x.toDouble(), v1y.toDouble())
+            val d2 = hypot(v2x.toDouble(), v2y.toDouble())
+            if (d1 < 1e-4 || d2 < 1e-4) return 0f
+            val cosA = ((v1x * v2x + v1y * v2y) / (d1 * d2)).coerceIn(-1.0, 1.0)
+            val angleDeg = acos(cosA) * 180.0 / PI
+            angleDeviationSum += abs(angleDeg - 90.0)
+        }
+        val avgDev = (angleDeviationSum / 4.0).toFloat()
+        val angleScore = (1f - avgDev / 38f).coerceIn(0f, 1f)
+
+        val topLen = hypot((q.trX - q.tlX).toDouble(), (q.trY - q.tlY).toDouble()).toFloat().coerceAtLeast(1e-4f)
+        val botLen = hypot((q.brX - q.blX).toDouble(), (q.brY - q.blY).toDouble()).toFloat().coerceAtLeast(1e-4f)
+        val leftLen = hypot((q.blX - q.tlX).toDouble(), (q.blY - q.tlY).toDouble()).toFloat().coerceAtLeast(1e-4f)
+        val rightLen = hypot((q.brX - q.trX).toDouble(), (q.brY - q.trY).toDouble()).toFloat().coerceAtLeast(1e-4f)
+        val horizSym = min(topLen, botLen) / max(topLen, botLen)
+        val vertSym = min(leftLen, rightLen) / max(leftLen, rightLen)
+        val symScore = ((horizSym + vertSym) * 0.5f).coerceIn(0f, 1f)
+
+        return (angleScore * 0.65f + symScore * 0.35f).coerceIn(0f, 1f)
+    }
+
+    /**
+     * Squares any quadrilateral into a crisp, level 90° rectangle spanning the average
+     * left/right/top/bottom boundaries of the current selection.
+     */
+    fun squareUpQuadToRectangle(q: NormalizedQuad): NormalizedQuad {
+        val left = ((q.tlX + q.blX) * 0.5f).coerceIn(0.01f, 0.90f)
+        val right = ((q.trX + q.brX) * 0.5f).coerceIn((left + 0.08f).coerceAtMost(0.99f), 0.99f)
+        val top = ((q.tlY + q.trY) * 0.5f).coerceIn(0.01f, 0.90f)
+        val bottom = ((q.blY + q.brY) * 0.5f).coerceIn((top + 0.08f).coerceAtMost(0.99f), 0.99f)
+        return NormalizedQuad(
+            tlX = left, tlY = top,
+            trX = right, trY = top,
+            brX = right, brY = bottom,
+            blX = left, blY = bottom,
+            confidence = q.confidence
+        )
     }
 
     private fun hasReasonableCornerAngles(q: NormalizedQuad): Boolean {

@@ -17,6 +17,7 @@ import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
@@ -73,6 +74,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
@@ -84,6 +86,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -298,9 +301,21 @@ fun LiveDocumentCameraView(
 
     val animatedStability by animateFloatAsState(
         targetValue = stabilityProgress,
-        animationSpec = tween(durationMillis = 100),
+        animationSpec = tween(durationMillis = 120),
         label = "auto_capture_stability"
     )
+
+    // 60fps liquid-smooth corner interpolation so live viewfinder rectangle NEVER twitches
+    val qTarget = detectedQuad ?: NormalizedQuad.FULL
+    val quadAnimSpec = tween<Float>(durationMillis = 140, easing = FastOutSlowInEasing)
+    val liveTlX by animateFloatAsState(qTarget.tlX, quadAnimSpec, label = "liveTlX")
+    val liveTlY by animateFloatAsState(qTarget.tlY, quadAnimSpec, label = "liveTlY")
+    val liveTrX by animateFloatAsState(qTarget.trX, quadAnimSpec, label = "liveTrX")
+    val liveTrY by animateFloatAsState(qTarget.trY, quadAnimSpec, label = "liveTrY")
+    val liveBrX by animateFloatAsState(qTarget.brX, quadAnimSpec, label = "liveBrX")
+    val liveBrY by animateFloatAsState(qTarget.brY, quadAnimSpec, label = "liveBrY")
+    val liveBlX by animateFloatAsState(qTarget.blX, quadAnimSpec, label = "liveBlX")
+    val liveBlY by animateFloatAsState(qTarget.blY, quadAnimSpec, label = "liveBlY")
 
     Box(
         modifier = Modifier
@@ -361,6 +376,8 @@ fun LiveDocumentCameraView(
                                 .build()
 
                             var smoothedQuad: NormalizedQuad? = null
+                            var pendingJumpQuad: NormalizedQuad? = null
+                            var pendingJumpFrames = 0
                             var steadyStartMs = 0L
                             var lastAnalyzedMs = 0L
                             var missedFrames = 0
@@ -373,7 +390,7 @@ fun LiveDocumentCameraView(
                                     ia.setAnalyzer(analysisExecutor) { imageProxy ->
                                         try {
                                             val now = System.currentTimeMillis()
-                                            if (now - lastAnalyzedMs >= 68L) {
+                                            if (now - lastAnalyzedMs >= 88L) {
                                                 lastAnalyzedMs = now
                                                 val analyzed = analyzeImageProxyFrame(imageProxy)
                                                 val mainExec = ContextCompat.getMainExecutor(ctx)
@@ -389,7 +406,6 @@ fun LiveDocumentCameraView(
                                                         val sceneDiff = if (prevFp != null) {
                                                             DocumentEdgeDetector.fingerprintDifference(prevFp, analyzed.fingerprint)
                                                         } else 1f
-                                                        // Require >= 1.1s after shot AND either paper removed OR noticeable visual change
                                                         val pageSwapped = elapsedSinceShot >= 1100L &&
                                                             (rawQuad == null || sceneDiff >= 0.11f)
                                                         if (pageSwapped) {
@@ -414,11 +430,71 @@ fun LiveDocumentCameraView(
 
                                                     if (rawQuad != null) {
                                                         missedFrames = 0
-                                                        val nextQuad = DocumentEdgeDetector.smoothQuad(smoothedQuad, rawQuad, alpha = 0.42f)
-                                                        val delta = if (smoothedQuad != null) {
-                                                            DocumentEdgeDetector.quadDelta(smoothedQuad!!, nextQuad)
-                                                        } else 1f
-                                                        smoothedQuad = nextQuad
+                                                        val cur = smoothedQuad
+                                                        val nextQuad: NormalizedQuad
+                                                        val effectiveDelta: Float
+
+                                                        if (cur == null) {
+                                                            // Require 2 consistent frames before first lock so random desk noise never flashes
+                                                            if (pendingJumpQuad != null && DocumentEdgeDetector.quadDelta(pendingJumpQuad!!, rawQuad) < 0.07f) {
+                                                                pendingJumpFrames++
+                                                            } else {
+                                                                pendingJumpQuad = rawQuad
+                                                                pendingJumpFrames = 1
+                                                            }
+                                                            if (pendingJumpFrames >= 2) {
+                                                                nextQuad = rawQuad
+                                                                smoothedQuad = nextQuad
+                                                                pendingJumpQuad = null
+                                                                pendingJumpFrames = 0
+                                                                effectiveDelta = 1f
+                                                            } else {
+                                                                mainExec.execute {
+                                                                    isWaitingForPageSwap = waitingSwapNow
+                                                                    cooldownRemainingSec = remSec
+                                                                    cooldownProgress = cdProg
+                                                                }
+                                                                return@setAnalyzer
+                                                            }
+                                                        } else {
+                                                            val rawDelta = DocumentEdgeDetector.quadDelta(cur, rawQuad)
+                                                            when {
+                                                                // 1. Deadband lock: freeze rock-solid when sensor noise < 1.8%
+                                                                rawDelta < 0.018f -> {
+                                                                    nextQuad = cur
+                                                                    pendingJumpQuad = null
+                                                                    pendingJumpFrames = 0
+                                                                    effectiveDelta = 0f
+                                                                }
+                                                                // 2. Smooth gradual tracking for genuine slight hand motion
+                                                                rawDelta < 0.11f -> {
+                                                                    nextQuad = DocumentEdgeDetector.smoothQuad(cur, rawQuad, alpha = 0.22f)
+                                                                    smoothedQuad = nextQuad
+                                                                    pendingJumpQuad = null
+                                                                    pendingJumpFrames = 0
+                                                                    effectiveDelta = DocumentEdgeDetector.quadDelta(cur, nextQuad)
+                                                                }
+                                                                // 3. Outlier rejection: require 3 consistent frames before jumping to a far location
+                                                                else -> {
+                                                                    if (pendingJumpQuad != null && DocumentEdgeDetector.quadDelta(pendingJumpQuad!!, rawQuad) < 0.06f) {
+                                                                        pendingJumpFrames++
+                                                                    } else {
+                                                                        pendingJumpQuad = rawQuad
+                                                                        pendingJumpFrames = 1
+                                                                    }
+                                                                    if (pendingJumpFrames >= 3) {
+                                                                        nextQuad = DocumentEdgeDetector.smoothQuad(cur, rawQuad, alpha = 0.45f)
+                                                                        smoothedQuad = nextQuad
+                                                                        pendingJumpQuad = null
+                                                                        pendingJumpFrames = 0
+                                                                        effectiveDelta = rawDelta
+                                                                    } else {
+                                                                        nextQuad = cur
+                                                                        effectiveDelta = 0f
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
 
                                                         val canAutoShoot = latestAutoEnabled &&
                                                             !captureInFlight.get() &&
@@ -426,10 +502,10 @@ fun LiveDocumentCameraView(
                                                             !inCooldown &&
                                                             !(latestScanMode == "idcard" && latestCapturedCount >= 2)
 
-                                                        // Smooth 850ms steady hold prevents premature jitter shots
-                                                        val progress = if (canAutoShoot && delta < 0.028f) {
+                                                        // Smooth 900ms rock-steady hold prevents premature jitter shots
+                                                        val progress = if (canAutoShoot && effectiveDelta < 0.020f) {
                                                             if (steadyStartMs == 0L) steadyStartMs = now
-                                                            ((now - steadyStartMs).toFloat() / 850f).coerceIn(0f, 1f)
+                                                            ((now - steadyStartMs).toFloat() / 900f).coerceIn(0f, 1f)
                                                         } else {
                                                             steadyStartMs = 0L
                                                             0f
@@ -448,8 +524,11 @@ fun LiveDocumentCameraView(
                                                         }
                                                     } else {
                                                         missedFrames++
-                                                        if (missedFrames >= 3) {
+                                                        // Hold locked quad calmly for 6 frames (~520ms) to avoid flicker
+                                                        if (missedFrames >= 6) {
                                                             smoothedQuad = null
+                                                            pendingJumpQuad = null
+                                                            pendingJumpFrames = 0
                                                             steadyStartMs = 0L
                                                             mainExec.execute {
                                                                 detectedQuad = null
@@ -535,21 +614,20 @@ fun LiveDocumentCameraView(
                 )
             }
 
-            val q = detectedQuad
-            if (q != null) {
-                val p0 = Offset(q.tlX * w, q.tlY * h)
-                val p1 = Offset(q.trX * w, q.trY * h)
-                val p2 = Offset(q.brX * w, q.brY * h)
-                val p3 = Offset(q.blX * w, q.blY * h)
+            if (detectedQuad != null) {
+                val p0 = Offset(liveTlX * w, liveTlY * h)
+                val p1 = Offset(liveTrX * w, liveTrY * h)
+                val p2 = Offset(liveBrX * w, liveBrY * h)
+                val p3 = Offset(liveBlX * w, liveBlY * h)
 
                 val pausedForNext = autoCaptureEnabled && (isWaitingForPageSwap || cooldownRemainingSec > 0)
                 val locking = animatedStability > 0.16f
                 val strokeColor = when {
                     pausedForNext -> Color(0xFFF59E0B) // Warm amber while waiting for user to swap paper
-                    locking -> Color(0xFF22C55E)       // Emerald green while locking onto new page
-                    else -> Color(0xFF38BDF8)          // Crisp cyan tracking
+                    locking -> Color(0xFF10B981)       // Emerald green while locking onto new page
+                    else -> Color(0xFF3B82F6)          // Google Docs Scanner electric blue lock
                 }
-                val fillColor = strokeColor.copy(alpha = if (locking) 0.22f else 0.12f)
+                val fillColor = strokeColor.copy(alpha = if (locking) 0.22f else 0.15f)
 
                 val path = Path().apply {
                     moveTo(p0.x, p0.y)
@@ -559,13 +637,34 @@ fun LiveDocumentCameraView(
                     close()
                 }
                 drawPath(path, color = fillColor)
-                drawPath(path, color = strokeColor, style = Stroke(width = 3.dp.toPx()))
+                drawPath(path, color = Color.White.copy(alpha = 0.45f), style = Stroke(width = 4.6.dp.toPx()))
+                drawPath(path, color = strokeColor, style = Stroke(width = 2.6.dp.toPx()))
 
                 listOf(p0, p1, p2, p3).forEach { corner ->
-                    drawCircle(color = strokeColor.copy(alpha = 0.26f), radius = 12.dp.toPx(), center = corner)
+                    drawCircle(color = strokeColor.copy(alpha = 0.28f), radius = 12.dp.toPx(), center = corner)
                     drawCircle(color = Color.White, radius = 6.5.dp.toPx(), center = corner)
                     drawCircle(color = strokeColor, radius = 4.dp.toPx(), center = corner)
                 }
+            } else if (scanMode != "idcard") {
+                // Clean Google Docs Scanner calm corner framing brackets while searching for paper
+                val padX = w * 0.10f
+                val padTop = h * 0.18f
+                val padBot = h * 0.24f
+                val arm = 26.dp.toPx()
+                val bracketColor = Color.White.copy(alpha = 0.52f)
+                val strokePx = 2.6.dp.toPx()
+                // TL
+                drawLine(bracketColor, Offset(padX, padTop), Offset(padX + arm, padTop), strokePx, StrokeCap.Round)
+                drawLine(bracketColor, Offset(padX, padTop), Offset(padX, padTop + arm), strokePx, StrokeCap.Round)
+                // TR
+                drawLine(bracketColor, Offset(w - padX, padTop), Offset(w - padX - arm, padTop), strokePx, StrokeCap.Round)
+                drawLine(bracketColor, Offset(w - padX, padTop), Offset(w - padX, padTop + arm), strokePx, StrokeCap.Round)
+                // BL
+                drawLine(bracketColor, Offset(padX, h - padBot), Offset(padX + arm, h - padBot), strokePx, StrokeCap.Round)
+                drawLine(bracketColor, Offset(padX, h - padBot), Offset(padX, h - padBot - arm), strokePx, StrokeCap.Round)
+                // BR
+                drawLine(bracketColor, Offset(w - padX, h - padBot), Offset(w - padX - arm, h - padBot), strokePx, StrokeCap.Round)
+                drawLine(bracketColor, Offset(w - padX, h - padBot), Offset(w - padX, h - padBot - arm), strokePx, StrokeCap.Round)
             }
 
             focusTapPoint?.let { tap ->
@@ -616,12 +715,20 @@ fun LiveDocumentCameraView(
             }
         }
 
-        // 5. Top Control Bar (Edge-to-Edge Status Bar Safe)
+        // 5. Top Control Bar (Edge-to-Edge Status Bar Safe + Smooth Gradient Scrim)
         Column(
             modifier = Modifier
                 .align(Alignment.TopCenter)
                 .fillMaxWidth()
-                .background(Color.Black.copy(alpha = 0.52f))
+                .background(
+                    Brush.verticalGradient(
+                        colors = listOf(
+                            Color(0xD9050912),
+                            Color(0x88050912),
+                            Color.Transparent
+                        )
+                    )
+                )
                 .statusBarsPadding()
                 .padding(horizontal = 8.dp, vertical = 8.dp),
             horizontalAlignment = Alignment.CenterHorizontally
@@ -821,7 +928,15 @@ fun LiveDocumentCameraView(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .fillMaxWidth()
-                .background(Color.Black.copy(alpha = 0.72f))
+                .background(
+                    Brush.verticalGradient(
+                        colors = listOf(
+                            Color.Transparent,
+                            Color(0xB8060A12),
+                            Color(0xF0060A12)
+                        )
+                    )
+                )
                 .navigationBarsPadding()
                 .padding(horizontal = 16.dp, vertical = 14.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
@@ -856,6 +971,8 @@ fun LiveDocumentCameraView(
                                 style = MaterialTheme.typography.labelLarge,
                                 color = Color.White,
                                 fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+                                maxLines = 1,
+                                softWrap = false,
                                 modifier = Modifier.padding(horizontal = 14.dp, vertical = 7.dp)
                             )
                         }
